@@ -22,7 +22,7 @@ pip install -e .[dev]
 Validate the example descriptor against the schema:
 
 ```sh
-python spec/examples/validate.py spec/examples/ShortJSON.json spec/Schema.json
+python spec/examples/validate.py spec/examples/telemetry_example.json spec/Schema.json
 ```
 
 > The GUI framework is not yet finalized; PySide6 + pyqtgraph is the leading candidate for

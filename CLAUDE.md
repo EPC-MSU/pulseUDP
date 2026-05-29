@@ -19,7 +19,7 @@ the code together.
 
 - `spec/RFC-pulseUDP.md` — the protocol RFC (the source of truth for wire behavior).
 - `spec/Schema.json` — JSON-Schema (draft-07) that telemetry **descriptors** must validate against.
-- `spec/examples/` — `ShortJSON.json` (illustrative descriptor, **not** normative) and `validate.py` (validator).
+- `spec/examples/` — `telemetry_example.json` (illustrative descriptor, **not** normative) and `validate.py` (validator).
 - `src/pulseudp/protocol.py` — wire framing/parsing; mirrors RFC §3 (header) and §5.2 (type widths).
 - `src/pulseudp/app.py`, `__main__.py` — GUI entry points (currently scaffold; `run()` raises `NotImplementedError`).
 
@@ -34,15 +34,16 @@ pytest                                 # run tests
 pytest tests/test_x.py::test_name      # run a single test
 
 # Validate a descriptor against the schema:
-python spec/examples/validate.py spec/examples/ShortJSON.json spec/Schema.json
+python spec/examples/validate.py spec/examples/telemetry_example.json spec/Schema.json
 ```
 
 ### Python environment gotcha (this machine)
 
 Only Python **3.6** (the default `python`) and **3.8** (`py -3.8`) are installed — there is no
-3.10+. `pyproject.toml` sets `requires-python = ">=3.8"`. `jsonschema` is installed on **3.6
-only**, so `validate.py` runs under `python` (3.6) but not `py -3.8`. `protocol.py` uses
-`from __future__ import annotations`, so its PEP 585 hints (`tuple[int, int]`) work on 3.8.
+3.10+. `pyproject.toml` sets `requires-python = ">=3.8"`, so **prefer `py -3.8`** for everything
+(tests, validator, the package). Both interpreters have `jsonschema` + `pytest` installed, but
+3.8's `Scripts` dir isn't on PATH — invoke tools as modules (`py -3.8 -m pytest`). `protocol.py`
+uses `from __future__ import annotations`, so its PEP 585 hints (`tuple[int, int]`) work on 3.8.
 
 ## Protocol invariants (must hold across RFC ↔ code)
 

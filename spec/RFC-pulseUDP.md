@@ -114,9 +114,9 @@ format; this section only summarises it.
 
 A worked example descriptor and a validator are provided under `examples/`:
 
-- `examples/ShortJSON.json` — an example descriptor (illustrative only, not normative).
+- `examples/telemetry_example.json` — an example descriptor (illustrative only, not normative).
 - `examples/validate.py` — validates a descriptor against the schema:
-  `python examples/validate.py examples/ShortJSON.json Schema.json` (requires the `jsonschema`
+  `python examples/validate.py examples/telemetry_example.json Schema.json` (requires the `jsonschema`
   package).
 
 ### 5.2 Types and on-wire width
