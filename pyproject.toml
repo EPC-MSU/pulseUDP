@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulseudp"
+version = "0.1.0"
+description = "On-the-fly telemetry collection and visualization for Ethernet-capable microcontrollers"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+dependencies = [
+    "jsonschema>=4",
+]
+
+[project.optional-dependencies]
+# GUI framework is not yet finalized; see README. pyqtgraph over PySide6 is the
+# leading candidate for high-rate (~20 kHz) telemetry plotting.
+gui = [
+    # "PySide6",
+    # "pyqtgraph",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+pulseudp = "pulseudp.app:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]

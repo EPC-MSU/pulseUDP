@@ -1,0 +1,2 @@
+# Runtime dependencies. For development use `pip install -e .[dev,gui]` instead.
+jsonschema>=4

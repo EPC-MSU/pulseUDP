@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "packet": {
+      "type": "object",
+      "properties": {
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "allOf": [
+              {
+                "properties": {
+                  "name": { "type": "string" },
+                  "type": { "type": "string" }
+                },
+                "required": ["name", "type"]
+              },
+              {
+                "if": {
+                  "properties": { "type": { "const": "bitfield" } },
+                  "required": ["type"]
+                },
+                "then": {
+                  "properties": {
+                    "name": { "type": "string" },
+                    "type": { "const": "bitfield" },
+                    "bits": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "minItems": 1
+                    }
+                  },
+                  "required": ["bits"],
+                  "additionalProperties": false
+                },
+                "else": {
+                  "properties": {
+                    "name": { "type": "string" },
+                    "type": { "type": "string" },
+                    "mult": { "type": "number" },
+                    "unit": { "type": "string" }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            ]
+          }
+        }
+      },
+      "required": ["fields"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["packet"],
+  "additionalProperties": false
+}
