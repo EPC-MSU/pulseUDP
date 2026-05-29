@@ -40,7 +40,8 @@ from .protocol import Descriptor
 
 DEFAULT_PORT = 2102
 REDRAW_HZ = 30
-DEFAULT_WINDOW_S = 1.0
+DEFAULT_VIEW_S = 1.0        # initial zoom: ~1 s per screen (wheel-controlled)
+DEFAULT_HISTORY_S = 10.0    # initial rolling-history retention (spin-box-controlled)
 MIN_WINDOW_S = 0.01
 MAX_WINDOW_S = 600.0
 
@@ -109,7 +110,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._model: Optional[PlotModel] = None
         self._ring: Optional[RingBuffer] = None
         self._running = False
-        self._window_s = DEFAULT_WINDOW_S
+        # Two independent time windows: how much data we KEEP (history, set by the
+        # spin box) vs how much we SHOW (view, set by the wheel). The wheel never
+        # touches retention, so zooming cannot discard data.
+        self._history_s = DEFAULT_HISTORY_S
+        self._view_s = DEFAULT_VIEW_S
 
         self._plots: List[pg.PlotItem] = []
         self._link_vb: Optional[pg.ViewBox] = None
@@ -143,8 +148,9 @@ class MainWindow(QtWidgets.QMainWindow):
         tele_box = QtWidgets.QGroupBox("Telemetry")
         tele_layout = QtWidgets.QVBoxLayout(tele_box)
         self._tree = QtWidgets.QTreeWidget()
-        self._tree.setHeaderLabels(["Name", "Type"])
-        self._tree.setColumnWidth(0, 200)
+        self._tree.setHeaderLabels(["", "Name", "Type"])
+        self._tree.setColumnWidth(0, 36)
+        self._tree.setColumnWidth(1, 180)
         tele_layout.addWidget(self._tree)
         splitter.addWidget(tele_box)
 
@@ -184,13 +190,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_btn.clicked.connect(self._on_start_stop)
         row.addWidget(self._start_btn)
 
-        row.addWidget(QtWidgets.QLabel("Window (s):"))
-        self._window_spin = QtWidgets.QDoubleSpinBox()
-        self._window_spin.setRange(MIN_WINDOW_S, MAX_WINDOW_S)
-        self._window_spin.setDecimals(2)
-        self._window_spin.setValue(DEFAULT_WINDOW_S)
-        self._window_spin.valueChanged.connect(self._on_window_changed)
-        row.addWidget(self._window_spin)
+        row.addWidget(QtWidgets.QLabel("History (s):"))
+        self._history_spin = QtWidgets.QDoubleSpinBox()
+        self._history_spin.setRange(MIN_WINDOW_S, MAX_WINDOW_S)
+        self._history_spin.setDecimals(2)
+        self._history_spin.setValue(DEFAULT_HISTORY_S)
+        self._history_spin.setToolTip(
+            "How much recent data to keep (rolling history). "
+            "Independent of the wheel zoom — zooming never discards data.")
+        self._history_spin.valueChanged.connect(self._on_history_changed)
+        row.addWidget(self._history_spin)
 
         row.addStretch(1)
         self._status = QtWidgets.QLabel("Not connected")
@@ -269,16 +278,17 @@ class MainWindow(QtWidgets.QMainWindow):
             client = self._client
             self._run_async(lambda: client.stop_stream(timeout=1.0))
 
-    def _on_window_changed(self, value: float) -> None:
-        self._window_s = float(value)
+    def _on_history_changed(self, value: float) -> None:
+        # The spin box controls data RETENTION only — never the zoom.
+        self._history_s = float(value)
         if self._ring is not None:
-            self._ring.set_window(self._window_s)
+            self._ring.set_window(self._history_s)
 
     # -- bridge slots (GUI thread) --------------------------------------------
 
     def _on_descriptor(self, descriptor: Descriptor) -> None:
         self._model = PlotModel(descriptor)
-        self._ring = RingBuffer(self._model.channel_keys, window_s=self._window_s)
+        self._ring = RingBuffer(self._model.channel_keys, window_s=self._history_s)
         self._build_plots(descriptor)
         self._start_btn.setEnabled(True)
 
@@ -326,10 +336,10 @@ class MainWindow(QtWidgets.QMainWindow):
         color_i = 0
         ts_name = descriptor.timestamp_field.name
 
-        # Telemetry tree: timestamp first (as time base), then plotted fields.
-        ts_item = QtWidgets.QTreeWidgetItem([ts_name + "  (time base)",
-                                             descriptor.timestamp_field.type])
-        ts_item.setForeground(0, QtGui.QBrush(QtGui.QColor("#888")))
+        # Telemetry tree: timestamp first (as time base, no checkbox), then fields.
+        ts_item = QtWidgets.QTreeWidgetItem(
+            ["", ts_name + "  (time base)", descriptor.timestamp_field.type])
+        ts_item.setForeground(1, QtGui.QBrush(QtGui.QColor("#888")))
         self._tree.addTopLevelItem(ts_item)
 
         field_by_name = {f.name: f for f in descriptor.fields}
@@ -368,14 +378,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 vb.setYRange(-0.5, max(1, len(group.traces)) - 0.5 + 0.8)
                 # Tree: bitfield field with its bits as children.
                 fld = field_by_name.get(group.title)
-                parent = self._make_field_item(group.title,
-                                               fld.type if fld else "bitfield", None)
+                parent = self._add_field_row(group.title,
+                                             fld.type if fld else "bitfield", None)
                 for bi, tr in enumerate(group.traces):
-                    child = QtWidgets.QTreeWidgetItem([tr.label, "bit"])
-                    child.setIcon(0, self._swatch(_PALETTE[
+                    child = QtWidgets.QTreeWidgetItem(["", tr.label, "bit"])
+                    child.setIcon(1, self._swatch(_PALETTE[
                         (color_i - len(group.traces) + bi) % len(_PALETTE)]))
                     parent.addChild(child)
-                self._tree.addTopLevelItem(parent)
                 parent.setExpanded(False)
             else:
                 for tr in group.traces:
@@ -384,20 +393,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     curve = plot.plot(pen=pg.mkPen(color, width=2), name=tr.label)
                     self._curves[tr.key] = curve
                     fld = field_by_name.get(tr.key)
-                    item = self._make_field_item(
-                        tr.label, fld.type if fld else "", color)
-                    self._tree.addTopLevelItem(item)
+                    self._add_field_row(tr.label, fld.type if fld else "", color)
 
         self._tree.expandToDepth(0)
 
-    def _make_field_item(self, name: str, type_str: str,
-                         color: Optional[str]) -> QtWidgets.QTreeWidgetItem:
-        item = QtWidgets.QTreeWidgetItem([name, type_str])
-        # Checkbox: checked + disabled (reserved for the future select feature).
-        item.setCheckState(0, QtCore.Qt.Checked)
-        item.setFlags(QtCore.Qt.ItemIsUserCheckable)  # no ItemIsEnabled -> greyed
+    def _add_field_row(self, name: str, type_str: str,
+                       color: Optional[str]) -> QtWidgets.QTreeWidgetItem:
+        """Add a top-level field row with a disabled (greyed) checkbox.
+
+        Only the checkbox is disabled — it is reserved for the future
+        field-selection feature — while the name/type text stays enabled and
+        normally coloured.
+        """
+        item = QtWidgets.QTreeWidgetItem(["", name, type_str])
         if color:
-            item.setIcon(0, self._swatch(color))
+            item.setIcon(1, self._swatch(color))
+        self._tree.addTopLevelItem(item)
+        check = QtWidgets.QCheckBox()
+        check.setChecked(True)
+        check.setEnabled(False)      # greyed; the row text remains enabled
+        check.setToolTip("Reserved for future telemetry-field selection")
+        self._tree.setItemWidget(item, 0, check)
         return item
 
     @staticmethod
@@ -423,18 +439,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._running and self._plots:
             latest = float(t[-1])
             self._plots[0].getViewBox().setXRange(
-                latest - self._window_s, latest, padding=0)
+                latest - self._view_s, latest, padding=0)
 
     # -- wheel state machine --------------------------------------------------
 
     def on_wheel(self, factor: float, x: Optional[float]) -> None:
-        new_win = min(MAX_WINDOW_S, max(MIN_WINDOW_S, self._window_s * factor))
-        self._window_s = new_win
-        self._window_spin.blockSignals(True)
-        self._window_spin.setValue(new_win)
-        self._window_spin.blockSignals(False)
-        if self._ring is not None:
-            self._ring.set_window(new_win)
+        # The wheel changes the VIEW width only; it never trims the RingBuffer, so
+        # data outside the visible range is retained (up to the history size) and
+        # reappears when zooming back out.
+        self._view_s = min(MAX_WINDOW_S, max(MIN_WINDOW_S, self._view_s * factor))
         if not self._running and self._plots and x is not None:
             # Stopped: zoom around the pointer (X is linked across plots).
             vb = self._plots[0].getViewBox()
@@ -442,6 +455,7 @@ class MainWindow(QtWidgets.QMainWindow):
             nx0 = x - (x - x0) * factor
             nx1 = x + (x1 - x) * factor
             vb.setXRange(nx0, nx1, padding=0)
+        # Running: _redraw() keeps following the latest sample at the new width.
 
     # -- teardown -------------------------------------------------------------
 
