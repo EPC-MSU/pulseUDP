@@ -10,9 +10,13 @@ Everything here is little-endian, matching the RFC.
 
 from __future__ import annotations
 
+import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field as _dc_field
 from enum import IntEnum
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 # --- Constants ---------------------------------------------------------------
 
@@ -88,5 +92,196 @@ def frame_size(fields: list[dict]) -> int:
     return sum(TYPE_WORDS[f["type"]] for f in fields) * WORD_BYTES
 
 
-# TODO(v0.1): frame value decoding (read each field from the low bytes of its
-# word span per the declared type) and CRC-16 validation (v1.0).
+# --- Descriptor and telemetry decoding --------------------------------------
+
+#: descriptor ``type`` token -> little-endian NumPy code. Each value reads from
+#: the LOW bytes of its 32-bit word span (RFC 5.2); for narrow types the high
+#: bytes of the word are sign/zero extension and are simply not read.
+_NUMPY_CODE = {
+    "int8": "i1", "uint8": "u1",
+    "int16": "<i2", "uint16": "<u2",
+    "int32": "<i4", "uint32": "<u4",
+    "bitfield": "<u4",
+    "float": "<f4",
+    "int64": "<i8", "uint64": "<u8",
+    "double": "<f8",
+}
+
+#: Field names treated as the time base, in preference order (case-insensitive).
+_TIMESTAMP_NAMES = ("timestamp", "time")
+
+
+@dataclass
+class Field:
+    """One telemetry field from a descriptor."""
+
+    name: str
+    type: str
+    units: Optional[str] = None
+    mult: Optional[float] = None
+    bits: Optional[List[str]] = None
+
+    @property
+    def words(self) -> int:
+        return TYPE_WORDS[self.type]
+
+    @property
+    def is_bitfield(self) -> bool:
+        return self.type == "bitfield"
+
+
+class Descriptor:
+    """A parsed telemetry descriptor: the field layout plus a NumPy decode plan.
+
+    Build one with :meth:`from_json` (the wire form), then call :meth:`decode`
+    on a ``TELEMETRY`` payload to get a structured array of packets, or
+    :meth:`channels` to get per-field physical-unit arrays.
+    """
+
+    def __init__(self, fields: List[Field], version: str,
+                 id: Optional[Dict[str, Any]] = None,
+                 raw: Optional[Dict[str, Any]] = None) -> None:
+        if not fields:
+            raise ValueError("descriptor has no fields")
+        self.fields = fields
+        self.version = version
+        self.id = id
+        self.raw = raw
+
+        # Build the structured dtype: each field at its word offset, sized by
+        # type; itemsize is the whole packet so frombuffer strides correctly.
+        self._dtype_names: List[str] = []
+        formats: List[str] = []
+        offsets: List[int] = []
+        seen: Dict[str, int] = {}
+        word = 0
+        for f in fields:
+            dname = f.name
+            if dname in seen:  # NumPy needs unique field names
+                seen[dname] += 1
+                dname = "{}__{}".format(f.name, seen[dname])
+            else:
+                seen[dname] = 0
+            self._dtype_names.append(dname)
+            formats.append(_NUMPY_CODE[f.type])
+            offsets.append(word * WORD_BYTES)
+            word += f.words
+        self.packet_size = word * WORD_BYTES
+        self._dtype = np.dtype({
+            "names": self._dtype_names,
+            "formats": formats,
+            "offsets": offsets,
+            "itemsize": self.packet_size,
+        })
+
+    # -- construction ---------------------------------------------------------
+
+    @classmethod
+    def from_json(cls, data, schema: Optional[Dict[str, Any]] = None,
+                  validate: bool = True) -> "Descriptor":
+        """Parse a descriptor from a JSON string/bytes or an already-parsed dict.
+
+        If ``schema`` is given and ``validate`` is true, the descriptor is
+        validated against it (draft-07) before parsing.
+        """
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8")
+        obj = json.loads(data) if isinstance(data, str) else data
+
+        if schema is not None and validate:
+            import jsonschema  # local import: only needed when validating
+            jsonschema.validate(instance=obj, schema=schema)
+
+        fields = [
+            Field(
+                name=f["name"],
+                type=f["type"],
+                units=f.get("units"),
+                mult=f.get("mult"),
+                bits=f.get("bits"),
+            )
+            for f in obj["fields"]
+        ]
+        return cls(fields=fields, version=obj["version"],
+                   id=obj.get("id"), raw=obj)
+
+    # -- decoding -------------------------------------------------------------
+
+    def packets_in(self, payload_length: int) -> int:
+        """Number of whole packets in a payload of ``payload_length`` bytes.
+
+        Trailing bytes that cannot form a whole packet are padding (RFC 5.3).
+        """
+        return payload_length // self.packet_size
+
+    def decode(self, payload: bytes) -> np.ndarray:
+        """Decode a ``TELEMETRY`` payload into a structured array of packets.
+
+        Returns one record per packet; access a column by its descriptor name
+        (or :meth:`channels` for physical-unit conversion).
+        """
+        n = self.packets_in(len(payload))
+        if n == 0:
+            return np.empty(0, dtype=self._dtype)
+        return np.frombuffer(payload, dtype=self._dtype, count=n)
+
+    def channels(self, packets: np.ndarray) -> Dict[str, np.ndarray]:
+        """Split a decoded packet array into per-field arrays.
+
+        Numeric fields are returned as ``float64`` with ``mult`` applied;
+        bitfields are returned as raw ``uint32`` (decode bits with
+        :meth:`bit_traces`). Keys are the original descriptor names.
+        """
+        out: Dict[str, np.ndarray] = {}
+        for f, dname in zip(self.fields, self._dtype_names):
+            col = packets[dname]
+            if f.is_bitfield:
+                out[f.name] = col
+            else:
+                v = col.astype(np.float64)
+                if f.mult is not None:
+                    v = v * f.mult
+                out[f.name] = v
+        return out
+
+    @staticmethod
+    def bit_traces(field: Field, values: np.ndarray) -> Dict[str, np.ndarray]:
+        """Expand a bitfield column into one 0/1 array per named bit.
+
+        Bits map from the LSB up; ``Reserved`` names are skipped (RFC 5.2).
+        """
+        traces: Dict[str, np.ndarray] = {}
+        for bit, name in enumerate(field.bits or []):
+            if name == "Reserved":
+                continue
+            traces[name] = ((values >> bit) & 1).astype(np.uint8)
+        return traces
+
+    # -- time base ------------------------------------------------------------
+
+    @property
+    def timestamp_index(self) -> int:
+        """Index of the field used as the time (X) base.
+
+        A field named ``timestamp``/``time`` (case-insensitive) wins; otherwise
+        the first field. The caller falls back to host arrival time if this
+        field is unsuitable.
+        """
+        for i, f in enumerate(self.fields):
+            if f.name.lower() in _TIMESTAMP_NAMES:
+                return i
+        return 0
+
+    @property
+    def timestamp_field(self) -> Field:
+        return self.fields[self.timestamp_index]
+
+    @property
+    def plot_fields(self) -> List[Field]:
+        """Fields to plot: everything except the time-base field."""
+        ts = self.timestamp_index
+        return [f for i, f in enumerate(self.fields) if i != ts]
+
+
+# TODO(v1.0): CRC-16 validation over the whole (possibly reassembled) message
+# once the polynomial is fixed (RFC 7).

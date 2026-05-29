@@ -20,22 +20,31 @@ the code together.
 - `spec/RFC-pulseUDP.md` — the protocol RFC (the source of truth for wire behavior).
 - `spec/Schema.json` — JSON-Schema (draft-07) that telemetry **descriptors** must validate against.
 - `spec/examples/` — `telemetry_example.json` (illustrative descriptor, **not** normative) and `validate.py` (validator).
-- `src/pulseudp/protocol.py` — wire framing/parsing; mirrors RFC §3 (header) and §5.2 (type widths).
-- `src/pulseudp/app.py`, `__main__.py` — GUI entry points (currently scaffold; `run()` raises `NotImplementedError`).
+- `src/pulseudp/protocol.py` — wire framing/parsing + `Descriptor` (validate JSON, build a NumPy structured-dtype decode plan); mirrors RFC §3 (header) and §5.2 (type widths).
+- `src/pulseudp/client.py` — `UdpClient`: socket + receiver thread, `DESCRIPTION`/`TELEMETRY`/`STOP` transactions; Qt-free (delivers via callbacks).
+- `src/pulseudp/model.py` — `PlotModel` (units grouping) + thread-safe rolling `RingBuffer`.
+- `src/pulseudp/discovery.py` — pluggable `Discovery`; default `NullDiscovery` finds nothing (no discovery protocol in the public RFC).
+- `src/pulseudp/app.py`, `__main__.py` — PyQt5 + pyqtgraph GUI. Receiver thread fills the `RingBuffer`; a `QTimer` redraws on the GUI thread. Design in `docs/gui-design.md`.
+- `tools/sim.py` — UDP telemetry simulator (firmware is out of scope); drives the client end to end.
 
 ## Commands
 
-The GUI framework is not yet chosen, so the app does not run end-to-end yet.
-
 ```sh
-pip install -e .[dev]                  # install package + pytest (editable, src layout)
-python -m pulseudp                     # launch GUI (NotImplementedError until built)
+pip install -e .[gui]                  # GUI deps: PyQt5 + pyqtgraph + numpy (PyQt5 is GPLv3)
+pip install -e .[dev]                  # package + pytest + numpy (editable, src layout)
+python -m pulseudp                     # launch the GUI client
+python tools/sim.py --rate 1000        # run the simulator (serves the example descriptor on :2102)
 pytest                                 # run tests
 pytest tests/test_x.py::test_name      # run a single test
 
 # Validate a descriptor against the schema:
 python spec/examples/validate.py spec/examples/telemetry_example.json spec/Schema.json
 ```
+
+The GUI splits acquisition from rendering: a receiver thread decodes datagrams (NumPy
+structured-dtype) into a thread-safe `RingBuffer`; a `QTimer` redraws curves on the GUI thread
+(never paint Qt from a worker thread). X-axis = an auto-detected timestamp field; the rolling
+history window is user-selectable. See `docs/gui-design.md`.
 
 ### Python environment gotcha (this machine)
 
@@ -44,6 +53,8 @@ Only Python **3.6** (the default `python`) and **3.8** (`py -3.8`) are installed
 (tests, validator, the package). Both interpreters have `jsonschema` + `pytest` installed, but
 3.8's `Scripts` dir isn't on PATH — invoke tools as modules (`py -3.8 -m pytest`). `protocol.py`
 uses `from __future__ import annotations`, so its PEP 585 hints (`tuple[int, int]`) work on 3.8.
+The GUI/decode stack (`numpy`, `PyQt5`, `pyqtgraph`) is installed on **3.8 only** — run the app,
+the simulator, and the test suite with `py -3.8`.
 
 ## Protocol invariants (must hold across RFC ↔ code)
 

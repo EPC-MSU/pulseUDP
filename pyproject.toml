@@ -14,14 +14,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# GUI framework is not yet finalized; see README. pyqtgraph over PySide6 is the
-# leading candidate for high-rate (~20 kHz) telemetry plotting.
+# pyqtgraph over PyQt5 for high-rate (~20 kHz) telemetry plotting. PyQt5 is chosen
+# for its support across the whole requires-python >=3.8 range; note it is GPLv3,
+# so the GUI application is GPLv3. See docs/gui-design.md.
 gui = [
-    # "PySide6",
-    # "pyqtgraph",
+    "PyQt5>=5.15",
+    "pyqtgraph>=0.13",
+    "numpy>=1.21",
 ]
 dev = [
     "pytest",
+    "numpy>=1.21",
 ]
 
 [project.scripts]
