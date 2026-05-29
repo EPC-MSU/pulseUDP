@@ -1,2 +1,12 @@
 .playwright-mcp
 
+# Working-group source material — not part of the published deliverable
+reference/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
