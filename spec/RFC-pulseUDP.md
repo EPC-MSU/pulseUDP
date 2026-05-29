@@ -131,6 +131,8 @@ The special flag type is also supported so binary flags can be sent along with n
 
 We detect the telemetry packet size from the number of the data points and their size. The descriptor along with the payload size is sufficient to decode the telemetry payload.
 
+The descriptor also carries a `version` (required) — its own revision in semantic-versioning form, e.g. `1.0.0`. This descriptor version is independent of the protocol version in the message header (§3); it lets a client recognise when the telemetry layout has changed. An optional `id` object may carry controller identification (such as device name, serial number, and firmware version) for display; its inner structure is not yet fixed.
+
 A descriptor MUST validate against the pulseUDP JSON-Schema (draft-07), published alongside
 this document as **`Schema.json`**. That schema is the normative definition of the descriptor
 format; this section only summarizes it.
@@ -160,9 +162,8 @@ from its in-memory buffer with no packing.
 | `double` | IEEE-754 double | 2 | 8 |
 
 **Bitfields.** A `bitfield` is always a `uint32`. Bits are assigned in the order listed in
-`bits`, starting from the least-significant bit. With fewer than 32 names, the high bits are
-zero. (The current schema assumes flags are contiguous from bit 0 with no gaps — the count of
-names equals the count of flags.)
+the descriptor, starting from the least-significant bit. With fewer than 32 names, the high bits are
+zero. The bit gaps are supported by using name `Reserved` in the descriptor.
 
 ### 5.3 Packet stream
 
@@ -188,7 +189,7 @@ So up to **45 telemetry packets per UDP datagram**.
 
 ### 5.5 Units and multipliers
 
-Raw integer values are converted to physical units on the client side using the descriptor as `value × mult` with the given `unit` — the controller never converts. `unit` may be a raw indication such as
+Raw integer values are converted to physical units on the client side using the descriptor as `value × mult` with the given `units` — the controller never converts. `units` may be a raw indication such as
 `ADC counts` or `UsrUnit` when no physical conversion is defined.
 
 ### 5.6 Multi-datagram messages (v1.0)
