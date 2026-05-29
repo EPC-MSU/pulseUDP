@@ -17,10 +17,10 @@ thread through Qt signals.
 from __future__ import annotations
 
 import json
+import pkgutil
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -52,10 +52,14 @@ _PALETTE = [
 
 
 def _load_schema() -> Optional[dict]:
-    """Best-effort load of spec/Schema.json (validation is optional)."""
-    path = Path(__file__).resolve().parents[2] / "spec" / "Schema.json"
+    """Load the bundled descriptor schema (validation is optional).
+
+    The schema ships as package data (``pulseudp/data/Schema.json``), so it is
+    available in installed wheels and frozen builds, not just source checkouts.
+    """
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = pkgutil.get_data("pulseudp", "data/Schema.json")
+        return json.loads(raw.decode("utf-8")) if raw else None
     except (OSError, ValueError):
         return None
 

@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "fields": {
+      "type": "array",
+      "description": "An array of available telemetry values",
+      "items": {
+        "allOf": [
+          {
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The name of the value in the telemetry stream for this specific field."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "int8",
+                  "uint8",
+                  "int16",
+                  "uint16",
+                  "int32",
+                  "uint32",
+                  "int64",
+                  "uint64",
+                  "float",
+                  "double",
+                  "bitfield"
+                ],
+                "description": "One of the standard C types. Integer/float, signed/unsigned, size."
+              },
+              "units": {
+                "type": "string",
+                "description": "The units for the type presentation. Optional. May be ommited when the value is unitless like a counter."
+              },
+              "mult": {
+                "type": "number",
+                "description": "Optional multiplier for the value. May be omitted when the multiplier is 1. May be helpful for fixed point values."
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ],
+            "type": "object",
+            "description": "Common required keys for every field (number or bitfield)"
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "bitfield"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "bitfield"
+                },
+                "bits": {
+                  "type": "array",
+                  "description": "The names of the flags starting from the the less significant bits.",
+                  "items": {
+                    "type": "string",
+                    "description": "The name of the flag. Flag name Reserved means that this bit is not used for any flag."
+                  },
+                  "minItems": 1,
+                  "maxItems": 32
+                }
+              },
+              "required": [
+                "bits"
+              ],
+              "additionalProperties": false
+            },
+            "else": {
+              "properties": {
+                "name": { "type": "string" },
+                "type": { "type": "string" },
+                "units": { "type": "string" },
+                "mult": { "type": "number" }
+              },
+              "additionalProperties": false
+            },
+            "description": "Bitfield gets name/type/bits; every other field gets name/type/units/mult"
+          }
+        ]
+      },
+      "minItems": 1
+    },
+    "version": {
+      "type": "string",
+      "description": "Descriptor version in semver format, e.g 1.2.3",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+    },
+    "id": {
+      "type": "object",
+      "description": "The identification structure of the pulseUDP server."
+    }
+  },
+  "required": [
+    "fields",
+    "version"
+  ],
+  "additionalProperties": true
+}

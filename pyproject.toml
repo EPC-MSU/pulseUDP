@@ -9,6 +9,20 @@ description = "On-the-fly telemetry collection and visualization for Ethernet-ca
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
+# Project source is CC0 (see LICENSE). NOTE: a standalone build (PyInstaller)
+# bundles PyQt5, so the distributed *binary* is governed by GPLv3 even though the
+# source is CC0; ship the third-party license texts with the binary. See README.
+keywords = ["telemetry", "udp", "microcontroller", "visualization", "pyqtgraph"]
+classifiers = [
+    "License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication",
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.8",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Topic :: System :: Networking :: Monitoring",
+]
 dependencies = [
     "jsonschema>=4",
 ]
@@ -26,9 +40,21 @@ dev = [
     "pytest",
     "numpy>=1.21",
 ]
+# Tools for producing distributable artifacts (wheel/sdist + standalone exe).
+package = [
+    "build",
+    "pyinstaller>=6",
+]
 
-[project.scripts]
+# gui-scripts (not scripts): on Windows this launcher has no attached console
+# window, so the GUI starts cleanly.
+[project.gui-scripts]
 pulseudp = "pulseudp.app:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# Ship the descriptor schema inside the package (loaded via pkgutil) so installed
+# wheels and frozen builds can validate descriptors, not just source checkouts.
+pulseudp = ["data/*.json"]
