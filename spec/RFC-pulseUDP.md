@@ -133,7 +133,7 @@ We detect the telemetry packet size from the number of the data points and their
 
 A descriptor MUST validate against the pulseUDP JSON-Schema (draft-07), published alongside
 this document as **`Schema.json`**. That schema is the normative definition of the descriptor
-format; this section only summarises it.
+format; this section only summarizes it.
 
 A worked example descriptor and a validator are provided under `examples/`:
 
@@ -166,9 +166,8 @@ names equals the count of flags.)
 
 ### 5.3 Packet stream
 
-A `TELEMETRY` payload is an integer number of telemetry packets laid end to end with no gaps.
-Each packet is the field values in descriptor order, each value sized per §5.2. The number of
-packets in a datagram = Payload length ÷ packet size.
+A `TELEMETRY` payload is an integer number of telemetry packets laid end to end with a possible gap in the end. The trailing gap may happen when an integer number of telemetry packets can't fit in the payload. Each packet is the field values in descriptor order, each value sized per §5.2. The number of
+packets in a datagram = round_down( Payload length ÷ packet size ).
 
 ### 5.4 Example packet
 
@@ -256,7 +255,15 @@ pieces within it.
 check the version before parsing further, since major versions are not required to be
 compatible.
 
-## 7. Open items
+## 7. Open issues
 
 1. **CRC-16 algorithm (v1.0)** — polynomial/variant to be fixed when v1.0 is finalized.
 2. CRC-16 have a significant chance of erroneous acceptance of the broken data stream. Consider to change to CRC-32.
+
+## 8. Future plans
+
+### Selectable telemetry fields
+
+Currently the telemetry structure is described by the JSON descriptor and cannot be changed from the client. But there is a way to enhance the pulseUDP protocol by changing the semantics of the telemetry fields from mandatory to optional. The descriptor will list all available fields for selection. Then two more message types will request and set the enable/disable bitfields corresponding to the sequence of the fields in the descriptor. The telemetry packet length will become variable.
+
+There is a cheap way to implement customizable telemetry in the microcontroller. The buffer for telemetry (and payload size) may have a fixed size for efficiency. When payload size cannot be divided by telemetry packet size we will just leave some padding. When client will ask for the excessive telemetry packet size, the server will refuse in its response message. The copying itself will be done by the list of the substitutable addresses from the full list of supported fields.
