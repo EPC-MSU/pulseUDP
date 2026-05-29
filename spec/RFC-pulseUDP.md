@@ -16,7 +16,7 @@ The protocol has two parts:
    sequence number, payload length, payload, and a CRC trailer). Sequence numbering and CRC
    are present in the header/trailer of every version but only become active in v1.0.
 2. **A JSON descriptor** that the controller sends on request, describing the layout of each
-   telemetry frame so the client can parse the binary stream generically.
+   telemetry packet so the client can parse the binary stream generically.
 
 A session is request/response: the client asks the controller for the descriptor and to start
 streaming; the controller then emits a continuous stream of telemetry messages until told to
@@ -91,7 +91,7 @@ transaction).
 | Constant | Value (uint16) | Transaction | client → controller | controller → client |
 |---|---|---|---|---|
 | `DESCRIPTION` | `0x0001` | Get descriptor | request, empty payload | JSON descriptor (see §5), UTF-8, no NUL terminator |
-| `TELEMETRY` | `0x0002` | Telemetry stream | request to start, empty payload | streamed telemetry frames, one or more per datagram (see §5.3), until stopped |
+| `TELEMETRY` | `0x0002` | Telemetry stream | request to start, empty payload | streamed telemetry packets, one or more per datagram (see §5.3), until stopped |
 | `STOP` | `0x0003` | Stop stream | request, empty payload | acknowledgement, empty payload (sent once streaming has ceased) |
 
 ### 4.1 Session flow
@@ -101,9 +101,9 @@ client                                      Controller
  |  DESCRIPTION (request)  ─────────────────►|   (records client source IP:port)
  |◄────────────  DESCRIPTION (JSON reply)    |   ← response (required)
  |  TELEMETRY (start request)  ─────────────►|
- |◄──────────────  TELEMETRY (frames)        |  ┐  first frame = ack (required)
- |◄──────────────  TELEMETRY (frames)        |  │  continuous stream
- |◄──────────────  TELEMETRY (frames)        |  ┘
+ |◄──────────────  TELEMETRY (packets)       |  ┐  first packet = ack (required)
+ |◄──────────────  TELEMETRY (packets)       |  │  continuous stream
+ |◄──────────────  TELEMETRY (packets)       |  ┘
  |  STOP  ──────────────────────────────────►|
  |◄──────────────────────  STOP (ack)        |   ← response (required)
 ```
@@ -113,11 +113,11 @@ until it observes that response. Because the protocol is explicitly request/resp
 request and its reply share a message type, the receiver distinguishes them by direction and
 payload — no heuristics.
 
-## 5. Payload: telemetry frames and the JSON descriptor
+## 5. Payload: telemetry packets and the JSON descriptor
 
 ### 5.1 The descriptor
 
-The `DESCRIPTION` payload is a JSON object describing one telemetry frame. It is sent as a
+The `DESCRIPTION` payload is a JSON object describing one telemetry packet. It is sent as a
 single UTF-8 string with no NUL terminator. Its structure is defined in the Schema.json file.
 
 The descriptor supports the list of the telemetry values, describing their
@@ -129,7 +129,7 @@ The descriptor supports the list of the telemetry values, describing their
 
 The special flag type is also supported so binary flags can be sent along with numbers.
 
-We detect the telemetry frame size from the number of the data points and their size. The descriptor along with the payload size is sufficient to decode the telemetry payload.
+We detect the telemetry packet size from the number of the data points and their size. The descriptor along with the payload size is sufficient to decode the telemetry payload.
 
 A descriptor MUST validate against the pulseUDP JSON-Schema (draft-07), published alongside
 this document as **`Schema.json`**. That schema is the normative definition of the descriptor
@@ -164,13 +164,13 @@ from its in-memory buffer with no packing.
 zero. (The current schema assumes flags are contiguous from bit 0 with no gaps — the count of
 names equals the count of flags.)
 
-### 5.3 Frame stream
+### 5.3 Packet stream
 
-A `TELEMETRY` payload is an integer number of frames laid end to end with no gaps. Each frame
-is the field values in descriptor order, each value sized per §5.2. The number of frames in a
-datagram = `Payload length / frame_size`.
+A `TELEMETRY` payload is an integer number of telemetry packets laid end to end with no gaps.
+Each packet is the field values in descriptor order, each value sized per §5.2. The number of
+packets in a datagram = Payload length ÷ packet size.
 
-### 5.4 Example frame
+### 5.4 Example packet
 
 | # | Field | Type | Words | Bytes |
 |---|---|---|---|---|
@@ -182,10 +182,10 @@ datagram = `Payload length / frame_size`.
 | 6 | `CurrentB` | int16, ×0.001 A | 1 | 4 |
 | 7 | `Flags` | bitfield (32 flags) | 1 | 4 |
 | 8 | `GeneralPurpose1` | int32, ×0.001 UsrUnit | 1 | 4 |
-| | **Frame total** | | 8 | 32 |
+| | **Packet total** | | 8 | 32 |
 
-**Datagram packing example:** header 12 B + 45 frames × 32 B + 4 B trailer = 1456 B ≤ 1472 B.
-So up to **45 frames per datagram**.
+**Datagram packing example:** header 12 B + 45 packets × 32 B + 4 B trailer = 1456 B ≤ 1472 B.
+So up to **45 telemetry packets per UDP datagram**.
 
 ### 5.5 Units and multipliers
 
@@ -245,7 +245,7 @@ pieces within it.
 |---|---|---|
 | Magic / version / type / payload-length header | ✔ | ✔ |
 | Request/response handshake (`DESCRIPTION` / `TELEMETRY` / `STOP`) | ✔ | ✔ |
-| JSON descriptor + binary frame stream | ✔ | ✔ |
+| JSON descriptor + binary packet stream | ✔ | ✔ |
 | Single-client session (new client supersedes the old) | ✔ | ✔ |
 | **Sequence number** | field present, sent as `0`, ignored | active, monotonic, used for loss detection |
 | **CRC trailer** (Reserved + CRC-16) | present, sent as `0` and ignored | present, filled and validated |

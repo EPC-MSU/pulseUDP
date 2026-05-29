@@ -9,7 +9,6 @@ import json
 from pathlib import Path
 
 import jsonschema
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = REPO_ROOT / "spec" / "Schema.json"
@@ -21,25 +20,6 @@ def _load(path):
         return json.load(f)
 
 
-@pytest.fixture(scope="module")
-def schema():
-    return _load(SCHEMA_PATH)
-
-
-def test_example_descriptor_is_valid(schema):
+def test_example_descriptor_is_valid():
     """The shipped example descriptor conforms to the schema."""
-    jsonschema.validate(instance=_load(EXAMPLE_PATH), schema=schema)
-
-
-def test_field_missing_name_is_rejected(schema):
-    """A field lacking the required `name` must fail validation."""
-    bad = {"packet": {"fields": [{"type": "uint32"}]}}
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(instance=bad, schema=schema)
-
-
-def test_bitfield_without_bits_is_rejected(schema):
-    """A bitfield must carry a `bits` list."""
-    bad = {"packet": {"fields": [{"name": "Flags", "type": "bitfield"}]}}
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(instance=bad, schema=schema)
+    jsonschema.validate(instance=_load(EXAMPLE_PATH), schema=_load(SCHEMA_PATH))

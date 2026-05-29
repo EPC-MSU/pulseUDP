@@ -13,7 +13,14 @@
               {
                 "properties": {
                   "name": { "type": "string" },
-                  "type": { "type": "string" }
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "int8", "uint8", "int16", "uint16",
+                      "int32", "uint32", "int64", "uint64",
+                      "float", "double", "bitfield"
+                    ]
+                  }
                 },
                 "required": ["name", "type"]
               },
@@ -29,7 +36,8 @@
                     "bits": {
                       "type": "array",
                       "items": { "type": "string" },
-                      "minItems": 1
+                      "minItems": 1,
+                      "maxItems": 32
                     }
                   },
                   "required": ["bits"],
@@ -39,8 +47,14 @@
                   "properties": {
                     "name": { "type": "string" },
                     "type": { "type": "string" },
-                    "mult": { "type": "number" },
-                    "unit": { "type": "string" }
+                    "mult": {
+                      "type": "number",
+                      "description": "Multiplier to convert the raw value to a physical quantity (value x mult). Omitted when it would be 1."
+                    },
+                    "unit": {
+                      "type": "string",
+                      "description": "Physical unit of the value after applying mult. Omitted when the value has no unit, e.g. a counter."
+                    }
                   },
                   "additionalProperties": false
                 }

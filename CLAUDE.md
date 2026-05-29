@@ -57,7 +57,7 @@ These span multiple sections of the RFC; get them right when editing either side
   — type in the high 16 bits, sequence in the low 16 bits. Both are therefore `uint16`.
 - **Message-type constants are shared by a request and its response** (`DESCRIPTION 0x0001`,
   `TELEMETRY 0x0002`, `STOP 0x0003`); direction + payload disambiguate.
-- **Telemetry frames:** each value occupies an integer number of **32-bit words** on the wire
+- **Telemetry packets:** each value occupies an integer number of **32-bit words** on the wire
   (≤4-byte types → 1 word; `int64`/`uint64`/`double` → 2 words). `Payload length` is the
   **total** logical payload size; a single datagram's byte count comes from the UDP datagram
   length (`udp_len − 12 − 4`).
