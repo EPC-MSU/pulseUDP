@@ -115,7 +115,7 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
     # Emit in datagram-sized batches; cap batch so we don't busy-spin.
     batch = max_packets
 
-    def send(mtype, payload=b""):
+    def send(mtype, payload=b"", drop=False):
         nonlocal seq
         # v0.1: sequence sent as 0 (RFC §3.1). v1.0: per-message counter.
         seq_field = (seq & 0xFFFF) if version[0] >= 1 else 0
@@ -132,7 +132,10 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
         else:
             # v0.1: CRC unused, sent as 0 and ignored by the receiver (RFC §3.1).
             crc = b"\x00\x00"
-        sock.sendto(framed + crc, client)
+        # A dropped datagram still consumes its sequence number (as a real lost
+        # packet would), so the receiver sees a gap; we just skip transmission.
+        if not drop:
+            sock.sendto(framed + crc, client)
         if version[0] >= 1:
             seq = (seq + 1) & 0xFFFF
 
@@ -167,8 +170,9 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
                 due = batch
                 payload = b"".join(_sample(descriptor, n + k, t0) for k in range(due))
                 n += due
-                if not (drop > 0 and (n // due) % int(1 / drop) == 0 and drop < 1):
-                    send(MessageType.TELEMETRY, payload)
+                drop_this = (drop > 0 and drop < 1
+                             and (n // due) % int(1 / drop) == 0)
+                send(MessageType.TELEMETRY, payload, drop=drop_this)
                 next_emit += period * due if period else 0.0
                 if period == 0.0:
                     next_emit = now + 0.001

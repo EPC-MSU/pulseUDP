@@ -247,6 +247,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_btn.setText("Start")
         self._start_btn.setEnabled(False)
 
+        # No version selector: the client probes at v1.0 and adopts whatever
+        # version the controller reveals in its DESCRIPTION reply (RFC §6.1).
         client = UdpClient(
             host, DEFAULT_PORT, schema=self._schema,
             on_telemetry=self._on_telemetry,

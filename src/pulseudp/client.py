@@ -13,16 +13,22 @@ from __future__ import annotations
 
 import queue
 import socket
+import struct
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
 from .protocol import (HEADER_SIZE, TRAILER_SIZE, Descriptor, Header,
-                       MessageType)
+                       MessageType, crc16_ccitt)
 
 DEFAULT_PORT = 2102
+#: Protocol versions this client understands, highest first. The first entry is
+#: the version used for the opening DESCRIPTION probe; the session then adopts
+#: whatever version the controller reveals in its reply (RFC §6.1).
+SUPPORTED_VERSIONS = ((1, 0), (0, 1))
+PROBE_VERSION = SUPPORTED_VERSIONS[0]
 _RECV_BUFSIZE = 65535
 _SOCK_TIMEOUT = 0.2  # s, receiver loop wakeup so it can observe close()
 
@@ -49,6 +55,14 @@ class UdpClient:
     ----------
     host, port:
         Controller address. ``port`` defaults to the protocol port 2102.
+    version:
+        The version used for the opening ``DESCRIPTION`` **probe**, ``(major,
+        minor)`` — the highest supported (v1.0) by default. The session version
+        is then *discovered*: :meth:`request_descriptor` reads the controller's
+        version from its reply and fixates ``self.version`` to it (RFC §6.1), so
+        all later requests are framed at the negotiated version. v1.0 stamps an
+        active sequence number + real CRC-16 (RFC §3.2); v0.1 sends both as zero.
+        Inbound validation always keys off each datagram's own version field.
     schema:
         Optional descriptor JSON-Schema; when given, descriptors are validated
         against it before use.
@@ -59,12 +73,14 @@ class UdpClient:
     """
 
     def __init__(self, host: str, port: int = DEFAULT_PORT,
+                 version: Tuple[int, int] = PROBE_VERSION,
                  schema: Optional[Dict[str, Any]] = None,
                  on_telemetry: Optional[TelemetryCb] = None,
                  on_log: Optional[LogCb] = None,
                  on_state: Optional[StateCb] = None) -> None:
         self.host = host
         self.port = port
+        self.version = version
         self.schema = schema
         self._on_telemetry = on_telemetry
         self._on_log = on_log
@@ -77,12 +93,15 @@ class UdpClient:
         self._closing = threading.Event()
 
         # Response routing from the receiver thread to waiting callers.
-        self._desc_q: "queue.Queue[bytes]" = queue.Queue()
+        # DESCRIPTION carries (reply_version, payload) so the caller can fixate
+        # the negotiated protocol version (RFC §6.1).
+        self._desc_q: "queue.Queue[Tuple[Tuple[int, int], bytes]]" = queue.Queue()
         self._stop_ack = threading.Event()
         self._stream_started = threading.Event()
 
         self._streaming = False
-        self._last_seq: Optional[int] = None
+        self._last_seq: Optional[int] = None   # last RX sequence (loss detection)
+        self._tx_seq = 0                        # next TX sequence (v1.0 outbound)
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -91,6 +110,8 @@ class UdpClient:
         if self._sock is not None:
             return
         self._closing.clear()
+        self._tx_seq = 0
+        self._last_seq = None
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(_SOCK_TIMEOUT)
         self._sock = sock
@@ -115,24 +136,46 @@ class UdpClient:
     # -- transactions ---------------------------------------------------------
 
     def request_descriptor(self, timeout: float = 1.0, retries: int = 3) -> Descriptor:
-        """Send ``DESCRIPTION`` and return the parsed descriptor (retransmits)."""
+        """Probe with ``DESCRIPTION``, negotiate the version, return the descriptor.
+
+        Sends the opening ``DESCRIPTION`` framed at the probe version (highest
+        supported), then fixates :attr:`version` to whatever the controller
+        reveals in its reply and uses that for the rest of the session (RFC
+        §6.1). A reply in an unsupported version raises ``RuntimeError``; no
+        reply within the retransmit budget raises ``TimeoutError`` (the endpoint
+        is unreachable — version is never the cause, since any controller
+        answers any request).
+        """
         self._require_open()
         self._emit_state("connecting", "{}:{}".format(self.host, self.port))
+        # Probe at the highest supported version; the controller answers
+        # regardless of version and the reply reveals its own (RFC §6.1).
+        self.version = PROBE_VERSION
         # Drain any stale reply.
         self._drain(self._desc_q)
         for attempt in range(retries):
             self._send(MessageType.DESCRIPTION)
             try:
-                payload = self._desc_q.get(timeout=timeout)
+                reply_version, payload = self._desc_q.get(timeout=timeout)
             except queue.Empty:
                 self._log("info", "info",
                           "DESCRIPTION timeout, retry {}/{}".format(attempt + 1, retries))
                 continue
+            if reply_version not in SUPPORTED_VERSIONS:
+                self._emit_state("error", "unsupported controller protocol "
+                                 "v{}.{}".format(*reply_version))
+                raise RuntimeError(
+                    "controller speaks unsupported protocol v{}.{}".format(
+                        *reply_version))
+            self.version = reply_version
+            self._log("info", "info",
+                      "negotiated protocol v{}.{}".format(*self.version))
             descriptor = Descriptor.from_json(
                 payload, schema=self.schema, validate=self.schema is not None)
             self.descriptor = descriptor
             self._emit_state("connected",
-                             "descriptor v{} · {} fields".format(
+                             "protocol v{}.{} · descriptor v{} · {} fields".format(
+                                 self.version[0], self.version[1],
                                  descriptor.version, len(descriptor.fields)))
             return descriptor
         self._emit_state("error", "no descriptor response")
@@ -199,11 +242,21 @@ class UdpClient:
                       "unsupported version {}.{}".format(*header.version))
             return
 
-        # v1.0+ activates sequence-loss detection; v0.1 sends 0 and is ignored.
-        if header.version[0] >= 1 and header.message_type == MessageType.TELEMETRY:
-            self._check_sequence(header.sequence)
-        # CRC-16 is a v1.0 concern (CRC-16/CCITT-FALSE, RFC §3.2); not yet
-        # implemented. Hook: validate over data[:-2] here.
+        # CRC and sequence are v1.0 concerns: in v0.1 both fields are sent as 0
+        # and ignored, so neither is checked. Each datagram is judged by its own
+        # version field, so the client handles a mixed/either-version controller.
+        if header.version[0] >= 1:
+            # Validate the trailer CRC-16/CCITT-FALSE (RFC §3.2) before trusting
+            # anything else in the datagram; a bad CRC means the header (and its
+            # sequence number) is unreliable, so drop without updating seq state.
+            if not self._crc_ok(data):
+                self._log("crc", "warning",
+                          "CRC mismatch (type 0x{:04x}); datagram dropped".format(
+                              header.message_type))
+                return
+            # Sequence-loss detection runs on the telemetry stream only.
+            if header.message_type == MessageType.TELEMETRY:
+                self._check_sequence(header.sequence)
 
         mtype = header.message_type
         avail = len(data) - HEADER_SIZE - TRAILER_SIZE
@@ -211,7 +264,8 @@ class UdpClient:
         payload = data[HEADER_SIZE:HEADER_SIZE + n_payload]
 
         if mtype == MessageType.DESCRIPTION:
-            self._desc_q.put(payload)
+            # Forward the reply's version so the caller can fixate it (RFC §6.1).
+            self._desc_q.put((header.version, payload))
         elif mtype == MessageType.STOP:
             self._stop_ack.set()
         elif mtype == MessageType.TELEMETRY:
@@ -237,6 +291,13 @@ class UdpClient:
         if packets.size:
             self._on_telemetry(packets)
 
+    def _crc_ok(self, data: bytes) -> bool:
+        """True if the trailer CRC-16 matches (RFC §3.2 covers Magic..Reserved)."""
+        if len(data) < HEADER_SIZE + TRAILER_SIZE:
+            return False   # too short to carry a trailer
+        stored = int.from_bytes(data[-2:], "little")
+        return stored == crc16_ccitt(data[:-2])
+
     def _check_sequence(self, seq: int) -> None:
         if self._last_seq is not None:
             expected = (self._last_seq + 1) & 0xFFFF
@@ -251,9 +312,18 @@ class UdpClient:
 
     def _send(self, mtype: MessageType, payload: bytes = b"") -> None:
         assert self._sock is not None
-        header = Header(message_type=int(mtype), sequence=0,
-                        payload_length=len(payload))
-        msg = header.pack() + payload + b"\x00\x00\x00\x00"  # Reserved + CRC, zero in v0.1
+        # v1.0: stamp an active per-message sequence and a real CRC; v0.1 zeroes
+        # both (sent and ignored, RFC §3.1).
+        if self.version[0] >= 1:
+            seq = self._tx_seq & 0xFFFF
+            self._tx_seq = (self._tx_seq + 1) & 0xFFFF
+        else:
+            seq = 0
+        header = Header(message_type=int(mtype), sequence=seq,
+                        payload_length=len(payload), version=self.version)
+        framed = header.pack() + payload + b"\x00\x00"   # ... + Reserved
+        crc = crc16_ccitt(framed) if self.version[0] >= 1 else 0
+        msg = framed + struct.pack("<H", crc)
         self._sock.sendto(msg, (self.host, self.port))
 
     def _require_open(self) -> None:

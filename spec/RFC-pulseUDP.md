@@ -1,14 +1,17 @@
 # pulseUDP — Telemetry-over-Ethernet Protocol
 
 **Status:** Draft / working document
-**Versions described:** `0.1` (current, partial) and `1.0` (full)
+**Versions described:** `0.1` (lite) and `1.0` (full)
 **Date:** 2026-05-29
 
 ---
 
 ## 1. Overview
 
-Ethernet bandwidth in modern microcontrollers (100BASE-TX) is high enough to provide several synchronous data points per timestamp at the ~20 kHz rates typically used for motor control. For example, 8 full 32-bit words at a 20 kHz rate use less than 6% of the 100 Mbit/s capacity, even accounting for UDP overhead.
+Ethernet bandwidth in modern microcontrollers (100BASE-TX) is high enough to provide several synchronous data points per timestamp at the ~20 kHz rates typically used for motor control. For example, 8 full 32-bit words at a 20 kHz rate use less than 6% of the 100 Mbit/s capacity, even accounting for UDP overhead. This favors creation of a telemetry streaming protocol developed for 32-bit microcontrollers with Ethernet support - **pulseUDP**. The system requirements for microcontroller implementation are about 10 kbytes considering that the prerequisite UDP/IP stack usually takes about 10 times more. The protocol have two versions:
+
+* Lite one `v0.1` with hardcoded telemetry list, one UDP datagram per packet, no CRC check, no packet sequencing, no version check. Easier to implement, fast to compute on the microcontroller side.
+* Full one `v1.0` with user-selectable telemetry streams, multiple datagram packets, error detection.
 
 The protocol has two parts:
 
@@ -18,9 +21,7 @@ The protocol has two parts:
 2. **A JSON descriptor** that the controller sends on request, describing the layout of each
    telemetry packet so the client can parse the binary stream generically.
 
-A session is request/response: the client asks the controller for the descriptor and to start
-streaming; the controller then emits a continuous stream of telemetry messages until told to
-stop.
+A protocol is strictly request/response: the server only sends message(s) as a response to the client; the message type of the response must be the same as in the request.
 
 ## 2. Transport
 
@@ -59,7 +60,7 @@ the layout below always describes the **reassembled** message.
  14+N     2    CRC-16           (uint16)
 ```
 
-**Header size:** 12 bytes. **Trailer:** 4 bytes, present in every version (CRC unused in v0.1).
+**Header size:** 12 bytes. **Trailer:** 4 bytes.
 
 ### 3.1 Field semantics
 
@@ -154,6 +155,8 @@ Every request is answered by a response (the dashed-back arrows). The client rep
 until it observes that response. Because the protocol is explicitly request/response and a
 request and its reply share a message type, the receiver distinguishes them by direction and
 payload — no heuristics.
+
+The protocol design allows client version descovery. Since version 0.1 server ignores the version number for the incoming packets, the client can send `v1.0` request and learn the server protocol version by its reply (§6.1).
 
 ## 5. Payload: telemetry packets and the JSON descriptor
 
@@ -283,9 +286,9 @@ pieces within it.
 
 ## 6. Version matrix
 
-| Capability | v0.1 (current) | v1.0 (full) |
+| Capability | v0.1 (lite) | v1.0 (full) |
 |---|---|---|
-| Magic / version / type / payload-length header | ✔ | ✔ |
+| Magic / version / type / payload-length header | server sets its version but doesn't check client's version | ✔ |
 | Request/response handshake (`DESCRIPTION` / `TELEMETRY` / `STOP`) | ✔ | ✔ |
 | JSON descriptor + binary packet stream | ✔ | ✔ |
 | Single-client session (new client supersedes the old) | ✔ | ✔ |
@@ -294,9 +297,36 @@ pieces within it.
 | **Multi-datagram messages** (one header/trailer, payload split over datagrams) | not allowed — every message fits one datagram | supported; in-order, all-or-nothing, whole-message CRC |
 | Adaptive / runtime descriptor (runtime substitution of reserved names) | not implemented | candidate (TBD) |
 
-`major.minor` is carried as two bytes (`Version major`, `Version minor`). A receiver MUST
-check the version before parsing further, since major versions are not required to be
-compatible.
+`major.minor` is carried as two bytes (`Version major`, `Version minor`). A client MUST
+read the version before parsing payload semantics, since major versions are not required to be
+wire-compatible in their *payloads*.
+
+A **request**, however, is version-independent above the header: `DESCRIPTION`, `TELEMETRY`,
+and `STOP` requests carry no payload, and the only header fields that differ between v0.1 and
+v1.0 are `sequence_number` and the CRC — which v0.1 already ignores. A server therefore
+MUST answer a well-formed request **regardless of the request's version field**, applying its
+own version's rules, and MUST stamp the response with the **server's own** version. A v0.1
+server in particular ignores the client's version exactly as it ignores the clients's
+sequence and CRC. This is what makes the client-side version discovery in §6.1 a single
+round-trip with no fallback.
+
+### 6.1 Version negotiation (client procedure)
+
+There is no separate negotiation message; the version a session uses is **discovered from the
+`DESCRIPTION` response** and then fixed for the rest of the session:
+
+1. The client sends `DESCRIPTION` framed as the **highest** version it supports (currently
+   **v1.0**: active sequence number + valid CRC).
+2. Every reachable controller answers (§6), and the response header carries the controller's
+   own version. The client reads that version:
+   - if it is a version the client supports (v0.1 or v1.0), the client **fixates** it and frames
+     all further requests (`TELEMETRY`, `STOP`) accordingly;
+   - if it is a version the client does **not** support, the client reports an incompatible
+     controller and does not stream.
+
+Because a v0.1 server validates neither the probe's sequence nor its CRC, and a v1.0
+server validates both (the v1.0 probe satisfies both), the first `DESCRIPTION` always
+elicits a version-revealing reply. The client never has to guess or alternate versions.
 
 ## 7. Open issues
 
