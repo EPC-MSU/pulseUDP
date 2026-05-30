@@ -1,4 +1,4 @@
-"""Tests for UdpClient v0.1 / v1.0 behavior (no sockets, no Qt).
+"""Tests for UdpClient v1.0 / v2.0 behavior (no sockets, no Qt).
 
 Covers the version-dependent wire rules: outbound framing (sequence + CRC) and
 inbound validation (CRC check, sequence-loss detection), exercising the receiver
@@ -30,12 +30,12 @@ def _datagram(mtype, seq, version, payload=b"", good_crc=True,
     hdr = Header(message_type=int(mtype), sequence=seq,
                  payload_length=len(payload), version=version)
     framed = hdr.pack() + payload + reserved
-    if version[0] >= 1:
+    if version[0] >= 2:
         crc = crc16_ccitt(framed)
         if not good_crc:
             crc ^= 0xFFFF        # corrupt a real CRC
     else:
-        crc = 0xBEEF if not good_crc else 0   # v0.1 garbage to prove it's ignored
+        crc = 0xBEEF if not good_crc else 0   # v1.0 garbage to prove it's ignored
     return framed + struct.pack("<H", crc)
 
 
@@ -50,24 +50,24 @@ class _FakeSock:
 # -- inbound: CRC validation --------------------------------------------------
 
 def test_v1_good_crc_is_accepted():
-    c = UdpClient("127.0.0.1", version=(1, 0))
-    c._handle_datagram(_datagram(MessageType.STOP, 0, (1, 0)))
+    c = UdpClient("127.0.0.1", version=(2, 0))
+    c._handle_datagram(_datagram(MessageType.STOP, 0, (2, 0)))
     assert c._stop_ack.is_set()            # STOP ack delivered
 
 
 def test_v1_bad_crc_is_dropped_and_logged():
     events = []
-    c = UdpClient("127.0.0.1", version=(1, 0), on_log=lambda e: events.append(e))
-    c._handle_datagram(_datagram(MessageType.STOP, 0, (1, 0), good_crc=False))
+    c = UdpClient("127.0.0.1", version=(2, 0), on_log=lambda e: events.append(e))
+    c._handle_datagram(_datagram(MessageType.STOP, 0, (2, 0), good_crc=False))
     assert not c._stop_ack.is_set()        # corrupt datagram dropped
     assert [e.category for e in events] == ["crc"]
 
 
 def test_v01_crc_field_is_ignored():
-    # v0.1 carries a nonzero (garbage) CRC; the receiver must still accept it.
+    # v1.0 carries a nonzero (garbage) CRC; the receiver must still accept it.
     events = []
-    c = UdpClient("127.0.0.1", version=(0, 1), on_log=lambda e: events.append(e))
-    c._handle_datagram(_datagram(MessageType.STOP, 0, (0, 1), good_crc=False))
+    c = UdpClient("127.0.0.1", version=(1, 0), on_log=lambda e: events.append(e))
+    c._handle_datagram(_datagram(MessageType.STOP, 0, (1, 0), good_crc=False))
     assert c._stop_ack.is_set()
     assert events == []
 
@@ -76,27 +76,27 @@ def test_v01_crc_field_is_ignored():
 
 def test_v1_telemetry_sequence_gap_logs():
     events = []
-    c = UdpClient("127.0.0.1", version=(1, 0), on_log=lambda e: events.append(e))
-    c._handle_datagram(_datagram(MessageType.TELEMETRY, 5, (1, 0)))
-    c._handle_datagram(_datagram(MessageType.TELEMETRY, 9, (1, 0)))   # gap of 4
+    c = UdpClient("127.0.0.1", version=(2, 0), on_log=lambda e: events.append(e))
+    c._handle_datagram(_datagram(MessageType.TELEMETRY, 5, (2, 0)))
+    c._handle_datagram(_datagram(MessageType.TELEMETRY, 9, (2, 0)))   # gap of 4
     cats = [e.category for e in events]
     assert cats == ["seq_gap"]
     assert "lost" in events[0].message
 
 
 def test_v01_telemetry_sequence_gap_is_silent():
-    # The whole point: v0.1 must not emit sequence errors (field is ignored).
+    # The whole point: v1.0 must not emit sequence errors (field is ignored).
     events = []
-    c = UdpClient("127.0.0.1", version=(0, 1), on_log=lambda e: events.append(e))
-    c._handle_datagram(_datagram(MessageType.TELEMETRY, 5, (0, 1)))
-    c._handle_datagram(_datagram(MessageType.TELEMETRY, 99, (0, 1)))
+    c = UdpClient("127.0.0.1", version=(1, 0), on_log=lambda e: events.append(e))
+    c._handle_datagram(_datagram(MessageType.TELEMETRY, 5, (1, 0)))
+    c._handle_datagram(_datagram(MessageType.TELEMETRY, 99, (1, 0)))
     assert events == []
 
 
 # -- outbound: framing per version --------------------------------------------
 
 def test_send_v1_stamps_sequence_and_valid_crc():
-    c = UdpClient("127.0.0.1", version=(1, 0))
+    c = UdpClient("127.0.0.1", version=(2, 0))
     c._sock = _FakeSock()
     for _ in range(3):
         c._send(MessageType.DESCRIPTION)
@@ -106,19 +106,19 @@ def test_send_v1_stamps_sequence_and_valid_crc():
         seqs.append(hdr.sequence)
         stored = int.from_bytes(data[-2:], "little")
         crc_ok.append(stored == crc16_ccitt(data[:-2]))
-        assert hdr.version == (1, 0)
+        assert hdr.version == (2, 0)
     assert seqs == [0, 1, 2]                # monotonic per-message
     assert all(crc_ok)                      # every request carries a real CRC
 
 
 def test_send_v01_zeroes_sequence_and_crc():
-    c = UdpClient("127.0.0.1", version=(0, 1))
+    c = UdpClient("127.0.0.1", version=(1, 0))
     c._sock = _FakeSock()
     c._send(MessageType.DESCRIPTION)
     c._send(MessageType.STOP)
     for data, _addr in c._sock.sent:
         hdr = Header.unpack(data)
-        assert hdr.version == (0, 1)
+        assert hdr.version == (1, 0)
         assert hdr.sequence == 0
         assert int.from_bytes(data[-2:], "little") == 0   # CRC sent as zero
 
@@ -130,7 +130,7 @@ def _client_replying(reply_version, probe_log=None):
 
     Models a reachable server that stamps its reply with ``reply_version``
     regardless of the probe's version. ``probe_log`` (if given) records the
-    version the client was framing each request at, to assert the probe is v1.0.
+    version the client was framing each request at, to assert the probe is v2.0.
     """
     c = UdpClient("127.0.0.1")
     c._sock = _FakeSock()
@@ -149,27 +149,27 @@ def _client_replying(reply_version, probe_log=None):
 
 def test_negotiation_probes_at_v1_and_fixes_v1():
     probes = []
-    c = _client_replying((1, 0), probe_log=probes)
+    c = _client_replying((2, 0), probe_log=probes)
     desc = c.request_descriptor(timeout=0.3, retries=2)
-    assert probes[0] == PROBE_VERSION == (1, 0)   # opening probe is v1.0
-    assert c.version == (1, 0)                     # fixated to the reply
+    assert probes[0] == PROBE_VERSION == (2, 0)   # opening probe is v2.0
+    assert c.version == (2, 0)                     # fixated to the reply
     assert len(desc.fields) == 2
 
 
 def test_negotiation_fixes_v01_in_one_round_trip():
-    # v0.1 server answers the v1.0 probe and reveals v0.1; client downgrades.
+    # v1.0 server answers the v2.0 probe and reveals v1.0; client downgrades.
     events = []
-    c = _client_replying((0, 1))
+    c = _client_replying((1, 0))
     c._on_log = lambda e: events.append(e)
     c.request_descriptor(timeout=0.3, retries=2)
-    assert c.version == (0, 1)
-    assert any("negotiated protocol v0.1" in e.message for e in events)
+    assert c.version == (1, 0)
+    assert any("negotiated protocol v1.0" in e.message for e in events)
 
 
 def test_negotiation_rejects_unsupported_version():
     # A reply in a parseable major but unknown version → incompatible.
-    c = _client_replying((1, 5))
-    with pytest.raises(RuntimeError, match="unsupported protocol v1.5"):
+    c = _client_replying((2, 5))
+    with pytest.raises(RuntimeError, match="unsupported protocol v2.5"):
         c.request_descriptor(timeout=0.3, retries=2)
 
 

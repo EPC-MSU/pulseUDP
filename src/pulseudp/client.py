@@ -27,7 +27,7 @@ DEFAULT_PORT = 2102
 #: Protocol versions this client understands, highest first. The first entry is
 #: the version used for the opening DESCRIPTION probe; the session then adopts
 #: whatever version the server reveals in its reply (RFC §6.1).
-SUPPORTED_VERSIONS = ((1, 0), (0, 1))
+SUPPORTED_VERSIONS = ((2, 0), (1, 0))
 PROBE_VERSION = SUPPORTED_VERSIONS[0]
 _RECV_BUFSIZE = 65535
 _SOCK_TIMEOUT = 0.2  # s, receiver loop wakeup so it can observe close()
@@ -57,11 +57,11 @@ class UdpClient:
         Server address. ``port`` defaults to the protocol port 2102.
     version:
         The version used for the opening ``DESCRIPTION`` **probe**, ``(major,
-        minor)`` — the highest supported (v1.0) by default. The session version
+        minor)`` — the highest supported (v2.0) by default. The session version
         is then *discovered*: :meth:`request_descriptor` reads the server's
         version from its reply and fixates ``self.version`` to it (RFC §6.1), so
-        all later requests are framed at the negotiated version. v1.0 stamps an
-        active sequence number + real CRC-16 (RFC §3.2); v0.1 sends both as zero.
+        all later requests are framed at the negotiated version. v2.0 stamps an
+        active sequence number + real CRC-16 (RFC §3.2); v1.0 sends both as zero.
         Inbound validation always keys off each datagram's own version field.
     schema:
         Optional descriptor JSON-Schema; when given, descriptors are validated
@@ -101,7 +101,7 @@ class UdpClient:
 
         self._streaming = False
         self._last_seq: Optional[int] = None   # last RX sequence (loss detection)
-        self._tx_seq = 0                        # next TX sequence (v1.0 outbound)
+        self._tx_seq = 0                        # next TX sequence (v2.0 outbound)
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -237,15 +237,15 @@ class UdpClient:
                 self._log("short", "warning", "short datagram: " + msg)
             return
 
-        if header.version[0] not in (0, 1):
+        if header.version[0] not in (1, 2):
             self._log("bad_version", "warning",
                       "unsupported version {}.{}".format(*header.version))
             return
 
-        # CRC and sequence are v1.0 concerns: in v0.1 both fields are sent as 0
+        # CRC and sequence are v2.0 concerns: in v1.0 both fields are sent as 0
         # and ignored, so neither is checked. Each datagram is judged by its own
         # version field, so the client handles a mixed/either-version server.
-        if header.version[0] >= 1:
+        if header.version[0] >= 2:
             # Validate the trailer CRC-16/CCITT-FALSE (RFC §3.2) before trusting
             # anything else in the datagram; a bad CRC means the header (and its
             # sequence number) is unreliable, so drop without updating seq state.
@@ -312,9 +312,9 @@ class UdpClient:
 
     def _send(self, mtype: MessageType, payload: bytes = b"") -> None:
         assert self._sock is not None
-        # v1.0: stamp an active per-message sequence and a real CRC; v0.1 zeroes
+        # v2.0: stamp an active per-message sequence and a real CRC; v1.0 zeroes
         # both (sent and ignored, RFC §3.1).
-        if self.version[0] >= 1:
+        if self.version[0] >= 2:
             seq = self._tx_seq & 0xFFFF
             self._tx_seq = (self._tx_seq + 1) & 0xFFFF
         else:
@@ -322,7 +322,7 @@ class UdpClient:
         header = Header(message_type=int(mtype), sequence=seq,
                         payload_length=len(payload), version=self.version)
         framed = header.pack() + payload + b"\x00\x00"   # ... + Reserved
-        crc = crc16_ccitt(framed) if self.version[0] >= 1 else 0
+        crc = crc16_ccitt(framed) if self.version[0] >= 2 else 0
         msg = framed + struct.pack("<H", crc)
         self._sock.sendto(msg, (self.host, self.port))
 
