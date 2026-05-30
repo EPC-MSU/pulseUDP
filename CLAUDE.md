@@ -75,7 +75,7 @@ These span multiple sections of the RFC; get them right when editing either side
 - **Versioning is `major.minor`** (two bytes). The RFC documents **v0.1** (sequence numbering and
   CRC fields present but **ignored/zero**; single-datagram only) and **v1.0** (sequence + CRC
   active; multi-datagram messages allowed). Don't conflate the two.
-- **Single client:** the controller serves one client at a time; a command from a new
+- **Single client:** the server serves one client at a time; a command from a new
   source address supersedes the previous client and **resets session state including the
   sequence counter**. Multi-datagram reassembly (RFC §5.7) depends on this.
 - **Descriptors are static in v0.1**, sent as a UTF-8 JSON string with no NUL terminator, and

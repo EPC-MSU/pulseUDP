@@ -20,10 +20,10 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
   bits hidden).
 - **Protocol version:** auto-negotiated, not chosen in the UI. On `Connect` the client sends the
   opening `DESCRIPTION` framed at the highest supported version (v1.0: active sequence + real
-  CRC-16/CCITT-FALSE, RFC §3.2) and **fixates the session to whatever version the controller
-  reveals in its reply** (RFC §6.1). Because a controller answers any request regardless of its
-  version field, this is a single round trip with no fallback: a v1.0 controller replies v1.0, a
-  v0.1 controller replies v0.1, and the client adopts it. A reply in an unsupported version is
+  CRC-16/CCITT-FALSE, RFC §3.2) and **fixates the session to whatever version the server
+  reveals in its reply** (RFC §6.1). Because a server answers any request regardless of its
+  version field, this is a single round trip with no fallback: a v1.0 server replies v1.0, a
+  v0.1 server replies v0.1, and the client adopts it. A reply in an unsupported version is
   reported as incompatible; no reply at all is a connection failure (unreachable endpoint), never
   a version mismatch. The negotiated version is logged (`negotiated protocol vX.Y`).
 - **Per-version wire behavior:** inbound datagrams are judged by their **own** version field.

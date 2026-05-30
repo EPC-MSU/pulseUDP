@@ -2,7 +2,7 @@
 
 A single-window PyQt5 + pyqtgraph application that:
 
-  1. addresses / (later) discovers a controller on UDP port 2102,
+  1. addresses / (later) discovers a server on UDP port 2102,
   2. requests the JSON descriptor (``DESCRIPTION``) and builds the plot layout,
   3. starts the telemetry stream (``TELEMETRY``) and plots it live,
   4. stops the stream (``STOP``).
@@ -248,7 +248,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_btn.setEnabled(False)
 
         # No version selector: the client probes at v1.0 and adopts whatever
-        # version the controller reveals in its DESCRIPTION reply (RFC §6.1).
+        # version the server reveals in its DESCRIPTION reply (RFC §6.1).
         client = UdpClient(
             host, DEFAULT_PORT, schema=self._schema,
             on_telemetry=self._on_telemetry,

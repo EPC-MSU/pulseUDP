@@ -1,7 +1,7 @@
 """pulseUDP telemetry simulator.
 
 A stand-in for the (out-of-scope) microcontroller firmware so the GUI and client
-can be developed and tested end to end. It implements the controller side of
+can be developed and tested end to end. It implements the server side of
 RFC §4:
 
 * answers ``DESCRIPTION`` with a descriptor (the example descriptor by default),

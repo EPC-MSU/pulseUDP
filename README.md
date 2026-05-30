@@ -9,7 +9,7 @@ out of scope for this repository.
 ## The protocol
 
 See [`spec/RFC-pulseUDP.md`](spec/RFC-pulseUDP.md). In short: the client requests a JSON
-descriptor from the controller over UDP port 2102, then starts a binary telemetry stream whose
+descriptor from the server over UDP port 2102, then starts a binary telemetry stream whose
 packet layout is given by that descriptor and validated against `spec/Schema.json`.
 
 ## The client

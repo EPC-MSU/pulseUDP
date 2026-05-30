@@ -26,7 +26,7 @@ from .protocol import (HEADER_SIZE, TRAILER_SIZE, Descriptor, Header,
 DEFAULT_PORT = 2102
 #: Protocol versions this client understands, highest first. The first entry is
 #: the version used for the opening DESCRIPTION probe; the session then adopts
-#: whatever version the controller reveals in its reply (RFC §6.1).
+#: whatever version the server reveals in its reply (RFC §6.1).
 SUPPORTED_VERSIONS = ((1, 0), (0, 1))
 PROBE_VERSION = SUPPORTED_VERSIONS[0]
 _RECV_BUFSIZE = 65535
@@ -49,16 +49,16 @@ StateCb = Callable[[str, str], None]          # (state, detail)
 
 
 class UdpClient:
-    """A single-controller pulseUDP client.
+    """A single-server pulseUDP client.
 
     Parameters
     ----------
     host, port:
-        Controller address. ``port`` defaults to the protocol port 2102.
+        Server address. ``port`` defaults to the protocol port 2102.
     version:
         The version used for the opening ``DESCRIPTION`` **probe**, ``(major,
         minor)`` — the highest supported (v1.0) by default. The session version
-        is then *discovered*: :meth:`request_descriptor` reads the controller's
+        is then *discovered*: :meth:`request_descriptor` reads the server's
         version from its reply and fixates ``self.version`` to it (RFC §6.1), so
         all later requests are framed at the negotiated version. v1.0 stamps an
         active sequence number + real CRC-16 (RFC §3.2); v0.1 sends both as zero.
@@ -139,16 +139,16 @@ class UdpClient:
         """Probe with ``DESCRIPTION``, negotiate the version, return the descriptor.
 
         Sends the opening ``DESCRIPTION`` framed at the probe version (highest
-        supported), then fixates :attr:`version` to whatever the controller
+        supported), then fixates :attr:`version` to whatever the server
         reveals in its reply and uses that for the rest of the session (RFC
         §6.1). A reply in an unsupported version raises ``RuntimeError``; no
         reply within the retransmit budget raises ``TimeoutError`` (the endpoint
-        is unreachable — version is never the cause, since any controller
+        is unreachable — version is never the cause, since any server
         answers any request).
         """
         self._require_open()
         self._emit_state("connecting", "{}:{}".format(self.host, self.port))
-        # Probe at the highest supported version; the controller answers
+        # Probe at the highest supported version; the server answers
         # regardless of version and the reply reveals its own (RFC §6.1).
         self.version = PROBE_VERSION
         # Drain any stale reply.
@@ -162,10 +162,10 @@ class UdpClient:
                           "DESCRIPTION timeout, retry {}/{}".format(attempt + 1, retries))
                 continue
             if reply_version not in SUPPORTED_VERSIONS:
-                self._emit_state("error", "unsupported controller protocol "
+                self._emit_state("error", "unsupported server protocol "
                                  "v{}.{}".format(*reply_version))
                 raise RuntimeError(
-                    "controller speaks unsupported protocol v{}.{}".format(
+                    "server speaks unsupported protocol v{}.{}".format(
                         *reply_version))
             self.version = reply_version
             self._log("info", "info",
@@ -244,7 +244,7 @@ class UdpClient:
 
         # CRC and sequence are v1.0 concerns: in v0.1 both fields are sent as 0
         # and ignored, so neither is checked. Each datagram is judged by its own
-        # version field, so the client handles a mixed/either-version controller.
+        # version field, so the client handles a mixed/either-version server.
         if header.version[0] >= 1:
             # Validate the trailer CRC-16/CCITT-FALSE (RFC §3.2) before trusting
             # anything else in the datagram; a bad CRC means the header (and its
