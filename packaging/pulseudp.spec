@@ -28,7 +28,10 @@ hiddenimports = collect_submodules("pyqtgraph")
 block_cipher = None
 
 a = Analysis(
-    [os.path.join(ROOT, "src", "pulseudp", "__main__.py")],
+    # Use a launcher with an absolute import, not the package's __main__.py:
+    # PyInstaller runs the entry script as top-level __main__ (no parent
+    # package), so __main__.py's relative `from .app import run` would fail.
+    [os.path.join(SPECPATH, "entrypoint.py")],
     pathex=[os.path.join(ROOT, "src")],
     binaries=[],
     datas=datas,
