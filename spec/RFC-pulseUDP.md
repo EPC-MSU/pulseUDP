@@ -15,7 +15,7 @@ The protocol has two parts:
 1. **A small framed message format** carried in UDP datagrams (magic, version, message type,
    sequence number, payload length, payload, and a CRC trailer). Sequence numbering and CRC
    are present in the header/trailer of every version but only become active in v1.0.
-2. **A JSON descriptor** that the controller sends on request, describing the layout of each
+2. **A JSON descriptor** that the controller sends on request, describing the layout structure of a
    telemetry packet so the client can parse the binary stream generically.
 
 A session is request/response: the client asks the controller for the descriptor and to start
@@ -159,7 +159,7 @@ payload — no heuristics.
 
 ### 5.1 The descriptor
 
-The `DESCRIPTION` payload is a JSON object describing one telemetry packet. It is sent as a
+The `DESCRIPTION` payload is a JSON object describing telemetry packet capabilities. It is sent as a
 single UTF-8 string with no NUL terminator. Its structure is defined in the Schema.json file.
 
 The descriptor supports the list of the telemetry values, describing their
@@ -170,6 +170,8 @@ The descriptor supports the list of the telemetry values, describing their
 * multiplier, so that the microcontroller may send native representation (possible fixed point) and the conversion is done in the client
 
 The special flag type is also supported so binary flags can be sent along with numbers.
+
+There is a difference in interpretation of JSON descriptor between the protocol versions. In version `0.1` the descriptor list exactly the fields that it will 
 
 We detect the telemetry packet size from the number of the data points and their size. The descriptor along with the payload size is sufficient to decode the telemetry payload.
 
