@@ -202,8 +202,8 @@ class UdpClient:
         # v1.0+ activates sequence-loss detection; v0.1 sends 0 and is ignored.
         if header.version[0] >= 1 and header.message_type == MessageType.TELEMETRY:
             self._check_sequence(header.sequence)
-        # CRC-16 is a v1.0 concern; the polynomial is unfixed (RFC §7) so the
-        # check is a stub for now. Hook: validate over data[:-2] here.
+        # CRC-16 is a v1.0 concern (CRC-16/CCITT-FALSE, RFC §3.2); not yet
+        # implemented. Hook: validate over data[:-2] here.
 
         mtype = header.message_type
         avail = len(data) - HEADER_SIZE - TRAILER_SIZE

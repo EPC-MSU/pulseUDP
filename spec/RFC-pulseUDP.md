@@ -74,7 +74,49 @@ the layout below always describes the **reassembled** message.
 | **Payload length** | `uint32` | Total number of payload bytes in the message — for a multi-datagram message (§5.7), the sum across all datagrams. MUST be 32-bit word aligned. May be `0`. |
 | **Payload** | bytes | Type-dependent; see §4 and §5. |
 | **Reserved** | `uint16` | Present in every version. Sender sets `0`, reserved for future use. |
-| **CRC-16** | `uint16` | Present in every version. CRC-16 over the bytes from Magic through the end of Reserved (i.e. the whole message except the CRC field itself); for a multi-datagram message this covers the **entire reassembled** message. **v0.1:** sender sets `0`, receiver ignores. **v1.0:** filled and validated. |
+| **CRC-16** | `uint16` | Present in every version. CRC-16 (algorithm in §3.2) over the bytes from Magic through the end of Reserved (i.e. the whole message except the CRC field itself); for a multi-datagram message this covers the **entire reassembled** message. Stored as a `uint16` **little-endian** (low byte at offset 14+N), like every other multi-byte field. **v0.1:** sender sets `0`, receiver ignores. **v1.0:** filled and validated. |
+
+### 3.2 CRC-16 algorithm
+
+The CRC-16 in the trailer is **CRC-16/CCITT-FALSE**. To leave no ambiguity for
+independent (including microcontroller) implementations, the full parameter set is:
+
+| Parameter | Value |
+|---|---|
+| Width | 16 bits |
+| Polynomial | `0x1021` |
+| Initial value | `0xFFFF` |
+| Input reflected | no |
+| Output reflected | no |
+| Final XOR | `0x0000` |
+| **Check** (CRC of the ASCII bytes `"123456789"`) | `0x29B1` |
+
+The **Check** value is the conformance test: an implementation that computes
+`0x29B1` over the nine bytes `31 32 33 34 35 36 37 38 39` is correct. (This is the
+non-reflected, init-`0xFFFF` variant — sometimes called "CCITT-FALSE" — **not** the
+reflected, init-`0x0000` Kermit variant, which would yield a different value.)
+
+**Coverage:** the CRC is computed over every byte of the message except the two
+CRC bytes themselves — Magic, both Version bytes, the Type & sequence word, Payload
+length, the whole Payload, and Reserved, in wire order. For a multi-datagram message
+(§5.7) it is computed over the **entire reassembled** message, not per datagram.
+
+The 16-bit result is then written to the trailer little-endian (§3.1), so on the wire
+a receiver may equivalently verify the message by running the same CRC over the bytes
+from Magic through the end of Reserved and comparing against the stored value.
+
+Reference (bitwise, MSB-first — matches the parameters above):
+
+```
+crc = 0xFFFF
+for each byte b in covered bytes:
+    crc ^= (b << 8)                       # 16-bit register
+    repeat 8 times:
+        if crc & 0x8000: crc = (crc << 1) ^ 0x1021
+        else:            crc = (crc << 1)
+    crc &= 0xFFFF
+# crc is the CRC-16 value; store little-endian
+```
 
 ## 4. Message types
 
@@ -258,8 +300,10 @@ compatible.
 
 ## 7. Open issues
 
-1. **CRC-16 algorithm (v1.0)** — polynomial/variant to be fixed when v1.0 is finalized.
-2. CRC-16 have a significant chance of erroneous acceptance of the broken data stream. Consider to change to CRC-32.
+1. **Integrity strength** — the v1.0 trailer carries a 16-bit CRC (CRC-16/CCITT-FALSE, §3.2).
+   For large multi-datagram messages this has a non-negligible chance of accepting a corrupted
+   stream. A future major version may widen the trailer to a CRC-32; this would be a
+   wire-incompatible change and is therefore deferred to a new `Version major`.
 
 ## 8. Future plans
 
