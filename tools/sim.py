@@ -1,7 +1,7 @@
 """pulseUDP telemetry simulator.
 
 A stand-in for the (out-of-scope) microcontroller firmware so the GUI and client
-can be developed and tested end to end. It implements the controller side of
+can be developed and tested end to end. It implements the server side of
 RFC §4:
 
 * answers ``DESCRIPTION`` with a descriptor (the example descriptor by default),
@@ -17,7 +17,7 @@ enough to exercise the plots.
 Usage::
 
     py -3.8 tools/sim.py                       # serve example descriptor on :2102
-    py -3.8 tools/sim.py --rate 2000 --version 1.0
+    py -3.8 tools/sim.py --rate 2000 --version 2.0
     py -3.8 tools/sim.py --descriptor path/to/descriptor.json
 """
 
@@ -115,25 +115,28 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
     # Emit in datagram-sized batches; cap batch so we don't busy-spin.
     batch = max_packets
 
-    def send(mtype, payload=b""):
+    def send(mtype, payload=b"", drop=False):
         nonlocal seq
-        # v0.1: sequence sent as 0 (RFC §3.1). v1.0: per-message counter.
-        seq_field = (seq & 0xFFFF) if version[0] >= 1 else 0
+        # v1.0: sequence sent as 0 (RFC §3.1). v2.0: per-message counter.
+        seq_field = (seq & 0xFFFF) if version[0] >= 2 else 0
         hdr = Header(message_type=int(mtype), sequence=seq_field,
                      payload_length=len(payload), version=(version[0], version[1]))
         reserved = b"\x00\x00"
         framed = hdr.pack() + payload + reserved
-        if version[0] >= 1:
-            # v1.0: real CRC-16/CCITT-FALSE over Magic..end of Reserved (RFC §3.2).
+        if version[0] >= 2:
+            # v2.0: real CRC-16/CCITT-FALSE over Magic..end of Reserved (RFC §3.2).
             crc_val = crc16_ccitt(framed)
             if bad_crc:
                 crc_val ^= 0xFFFF   # corrupt it to exercise the client's reject path
             crc = struct.pack("<H", crc_val)
         else:
-            # v0.1: CRC unused, sent as 0 and ignored by the receiver (RFC §3.1).
+            # v1.0: CRC unused, sent as 0 and ignored by the receiver (RFC §3.1).
             crc = b"\x00\x00"
-        sock.sendto(framed + crc, client)
-        if version[0] >= 1:
+        # A dropped datagram still consumes its sequence number (as a real lost
+        # packet would), so the receiver sees a gap; we just skip transmission.
+        if not drop:
+            sock.sendto(framed + crc, client)
+        if version[0] >= 2:
             seq = (seq + 1) & 0xFFFF
 
     while True:
@@ -167,8 +170,9 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
                 due = batch
                 payload = b"".join(_sample(descriptor, n + k, t0) for k in range(due))
                 n += due
-                if not (drop > 0 and (n // due) % int(1 / drop) == 0 and drop < 1):
-                    send(MessageType.TELEMETRY, payload)
+                drop_this = (drop > 0 and drop < 1
+                             and (n // due) % int(1 / drop) == 0)
+                send(MessageType.TELEMETRY, payload, drop=drop_this)
                 next_emit += period * due if period else 0.0
                 if period == 0.0:
                     next_emit = now + 0.001
@@ -179,14 +183,14 @@ def main(argv=None) -> int:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--rate", type=float, default=1000.0, help="samples/second")
-    p.add_argument("--version", default="0.1", choices=("0.1", "1.0"),
-                   help="protocol version: 0.1 (seq=0, CRC=0) or 1.0 (active seq, "
+    p.add_argument("--version", default="1.0", choices=("1.0", "2.0"),
+                   help="protocol version: 1.0 (seq=0, CRC=0) or 2.0 (active seq, "
                         "real CRC-16/CCITT-FALSE)")
     p.add_argument("--descriptor", help="path to a descriptor JSON (default: example)")
     p.add_argument("--drop", type=float, default=0.0,
-                   help="fraction of datagrams to drop (v1.0 loss test), 0..1")
+                   help="fraction of datagrams to drop (v2.0 loss test), 0..1")
     p.add_argument("--bad-crc", action="store_true",
-                   help="send a wrong CRC-16 (v1.0 only) to test the log path")
+                   help="send a wrong CRC-16 (v2.0 only) to test the log path")
     args = p.parse_args(argv)
 
     major, minor = (int(x) for x in args.version.split("."))

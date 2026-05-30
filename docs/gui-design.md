@@ -18,9 +18,19 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
 - **Grouping:** fields sharing `units` share one plot; **unitless fields get one plot each**;
   each `bitfield` is one stacked digital plot with one colored trace per bit (`Reserved`
   bits hidden).
-- **v0.1 log behavior:** sequence-gap and bad-CRC log rows are wired but inert under v0.1
-  (those fields are sent as zero and ignored); bad-magic / unknown-version / short-datagram /
-  decode-size-mismatch are active in v0.1.
+- **Protocol version:** auto-negotiated, not chosen in the UI. On `Connect` the client sends the
+  opening `DESCRIPTION` framed at the highest supported version (v2.0: active sequence + real
+  CRC-16/CCITT-FALSE, RFC §3.2) and **fixates the session to whatever version the server
+  reveals in its reply** (RFC §6.1). Because a server answers any request regardless of its
+  version field, this is a single round trip with no fallback: a v2.0 server replies v2.0, a
+  v1.0 server replies v1.0, and the client adopts it. A reply in an unsupported version is
+  reported as incompatible; no reply at all is a connection failure (unreachable endpoint), never
+  a version mismatch. The negotiated version is logged (`negotiated protocol vX.Y`).
+- **Per-version wire behavior:** inbound datagrams are judged by their **own** version field.
+  Under v2.0 the CRC is validated over Magic..Reserved and a mismatch drops the datagram with a
+  `crc` log row, while telemetry sequence loss logs a `seq_gap` row. Under v1.0 the sequence and
+  CRC fields are sent as zero and ignored, so those rows stay inert; bad-magic / unknown-version
+  / short-datagram / decode-size-mismatch are active in both versions.
 
 ## Library stack
 
@@ -91,7 +101,7 @@ one call; multipliers apply as vectorized float ops. `n_packets = payload_len //
 
 Listens on UDP 2102; answers `DESCRIPTION` with `spec/examples/telemetry_example.json`; on
 `TELEMETRY` streams RFC-conformant packets (configurable rate, multiple packets per datagram,
-optional injected loss / bad CRC to exercise v1.0 log paths). Honors single-client supersede
+optional injected loss / bad CRC to exercise v2.0 log paths). Honors single-client supersede
 and the `STOP` ack.
 
 ## Testing
@@ -102,5 +112,6 @@ optional (`pytest-qt`), kept minimal.
 
 ## Deferred (unchanged by this design)
 
-Real discovery algorithm; selectable telemetry fields (RFC §8); CRC-16 polynomial (RFC §7) —
-the v1.0 CRC log path is wired but the check is a stub until the polynomial is fixed.
+Real discovery algorithm; selectable telemetry fields (RFC §8); multi-datagram message
+reassembly (RFC §5.7) — the v2.0 single-datagram path is implemented and the CRC is validated
+(CRC-16/CCITT-FALSE, RFC §3.2), but splitting a message across datagrams is not yet handled.

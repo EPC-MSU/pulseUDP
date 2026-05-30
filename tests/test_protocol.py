@@ -84,9 +84,9 @@ def test_crc16_ccitt_empty_is_init():
 
 
 def test_crc16_ccitt_covers_whole_frame_except_crc():
-    # A valid v1.0 trailer: CRC over Magic..end of Reserved round-trips.
+    # A valid v2.0 trailer: CRC over Magic..end of Reserved round-trips.
     hdr = Header(message_type=int(MessageType.TELEMETRY), sequence=7,
-                 payload_length=0, version=(1, 0)).pack()
+                 payload_length=0, version=(2, 0)).pack()
     framed = hdr + b"\x00\x00"                 # + empty payload + Reserved
     crc = crc16_ccitt(framed)
     datagram = framed + struct.pack("<H", crc)

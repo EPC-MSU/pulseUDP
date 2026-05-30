@@ -15,7 +15,7 @@ from typing import List
 
 @dataclass
 class Device:
-    """A discovered controller the user can pick from the list."""
+    """A discovered server the user can pick from the list."""
 
     name: str
     address: str        # IPv4 string the IP field is filled with
@@ -25,7 +25,7 @@ class Discovery:
     """Discovery backend interface."""
 
     def search(self, timeout: float = 1.0) -> List[Device]:
-        """Return the controllers found within ``timeout`` seconds."""
+        """Return the servers found within ``timeout`` seconds."""
         raise NotImplementedError
 
 

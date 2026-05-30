@@ -24,7 +24,7 @@ import numpy as np
 MAGIC = b"\x50\x55"
 
 #: Protocol version this implementation speaks (major, minor).
-VERSION = (0, 1)
+VERSION = (1, 0)
 
 #: Header layout: magic(2) major(1) minor(1) type_seq(uint32) payload_len(uint32).
 _HEADER = struct.Struct("<2sBBII")
@@ -97,7 +97,7 @@ def crc16_ccitt(data: bytes) -> int:
 
     Parameters: poly ``0x1021``, init ``0xFFFF``, no input/output reflection,
     final XOR ``0x0000``. Check value for ``b"123456789"`` is ``0x29B1``.
-    Used for the v1.0 trailer CRC, computed over Magic through end of Reserved
+    Used for the v2.0 trailer CRC, computed over Magic through end of Reserved
     (i.e. the whole message except the two CRC bytes). The 16-bit result is
     stored little-endian in the trailer.
     """
@@ -301,6 +301,6 @@ class Descriptor:
         return [f for i, f in enumerate(self.fields) if i != ts]
 
 
-# TODO(v1.0): CRC-16 validation over the whole (possibly reassembled) message.
+# TODO(v2.0): CRC-16 validation over the whole (possibly reassembled) message.
 # Algorithm is CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection,
 # xorout 0x0000; check value 0x29B1) — see RFC §3.2.

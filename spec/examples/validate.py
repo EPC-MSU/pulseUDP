@@ -5,57 +5,56 @@ JSON Validator by Schema
 Usage:
     python validate_json.py <json_file> <schema_file>
 
-Пример:
+Example:
     python validate_json.py data.json schema.json
 """
 
 import json
 import sys
 import argparse
-from pathlib import Path
 
 try:
     from jsonschema import validate, ValidationError
 except ImportError:
-    print("Ошибка: библиотека 'jsonschema' не установлена.")
-    print("Установите её командой: pip install jsonschema")
+    print("Error: the 'jsonschema' library is not installed.")
+    print("Install it with: pip install jsonschema")
     sys.exit(1)
 
 def load_json_file(file_path):
-    """Загружает JSON из файла, возвращает объект Python."""
+    """Load JSON from a file and return a Python object."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"Ошибка: файл не найден - {file_path}")
+        print(f"Error: file not found - {file_path}")
         sys.exit(1)
     except json.JSONDecodeError as e:
-        print(f"Ошибка: некорректный JSON в файле {file_path}\n{e}")
+        print(f"Error: invalid JSON in file {file_path}\n{e}")
         sys.exit(1)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Проверяет JSON-файл на соответствие JSON Schema."
+        description="Validates a JSON file against a JSON Schema."
     )
-    parser.add_argument("json_file", help="Путь к JSON-файлу для проверки")
-    parser.add_argument("schema_file", help="Путь к файлу с JSON Schema")
+    parser.add_argument("json_file", help="Path to the JSON file to validate")
+    parser.add_argument("schema_file", help="Path to the JSON Schema file")
     args = parser.parse_args()
 
-    # Загрузка данных
+    # Load data
     json_data = load_json_file(args.json_file)
     schema_data = load_json_file(args.schema_file)
 
-    # Валидация
+    # Validation
     try:
         validate(instance=json_data, schema=schema_data)
-        print("[OK] JSON успешно прошёл проверку по схеме.")
+        print("[OK] JSON validated successfully against the schema.")
     except ValidationError as e:
-        print("[ERROR] Ошибка валидации:")
-        print(f"   Путь: {' -> '.join(str(p) for p in e.absolute_path) or 'корень'}")
-        print(f"   Сообщение: {e.message}")
-        # Дополнительно: показать схему в месте ошибки (опционально)
+        print("[ERROR] Validation error:")
+        print(f"   Path: {' -> '.join(str(p) for p in e.absolute_path) or 'root'}")
+        print(f"   Message: {e.message}")
+        # Optionally: show the schema at the point of the error
         if e.schema:
-            print(f"   Схема ограничения: {e.schema}")
+            print(f"   Constraint schema: {e.schema}")
         sys.exit(1)
 
 if __name__ == "__main__":

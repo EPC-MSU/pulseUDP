@@ -1,49 +1,50 @@
 # pulseUDP — Telemetry-over-Ethernet Protocol
 
 **Status:** Draft / working document
-**Versions described:** `0.1` (current, partial) and `1.0` (full)
+**Versions described:** `1.0` (lite) and `2.0` (full)
 **Date:** 2026-05-29
 
 ---
 
 ## 1. Overview
 
-Ethernet bandwidth in modern microcontrollers (100BASE-TX) is high enough to provide several synchronous data points per timestamp at the ~20 kHz rates typically used for motor control. For example, 8 full 32-bit words at a 20 kHz rate use less than 6% of the 100 Mbit/s capacity, even accounting for UDP overhead.
+Ethernet bandwidth in modern microcontrollers (100BASE-TX) is high enough to provide several synchronous data points per timestamp at the ~20 kHz rates typically used for motor control. For example, 8 full 32-bit words at a 20 kHz rate use less than 6% of the 100 Mbit/s capacity, even accounting for UDP overhead. This favors creation of a telemetry streaming protocol developed for 32-bit microcontrollers with Ethernet support - **pulseUDP**. The system requirements for microcontroller implementation are about 10 kbytes considering that the prerequisite UDP/IP stack usually takes about 10 times more. The protocol have two versions:
+
+* Lite one `v1.0` with hardcoded telemetry list, one UDP datagram per packet, no CRC check, no packet sequencing, no version check. Easier to implement, fast to compute on the microcontroller side.
+* Full one `v2.0` with user-selectable telemetry streams, multiple datagram packets, error detection.
 
 The protocol has two parts:
 
 1. **A small framed message format** carried in UDP datagrams (magic, version, message type,
    sequence number, payload length, payload, and a CRC trailer). Sequence numbering and CRC
-   are present in the header/trailer of every version but only become active in v1.0.
+   are present in the header/trailer of every version but only become active in v2.0.
 2. **A JSON descriptor** that the controller sends on request, describing the layout structure of a
    telemetry packet so the client can parse the binary stream generically.
 
-A session is request/response: the client asks the controller for the descriptor and to start
-streaming; the controller then emits a continuous stream of telemetry messages until told to
-stop.
+A protocol is strictly request/response: the server only sends message(s) as a response to the client; the message type of the response must be the same as in the request.
 
 ## 2. Transport
 
 - **Protocol:** UDP.
-- **Port:** `2102` (controller listens here; client sends commands here).
+- **Port:** `2102` (server listens here; client sends commands here).
 - **Byte order:** little-endian for all multi-byte fields.
 - **MTU budget:** one datagram payload is kept within a single Ethernet frame — **1472 bytes**
   of UDP payload (1500 MTU − 20 IP − 8 UDP). A telemetry message MUST fit in one datagram for
-  efficiency. From protocol **v1.0** onward, other message types MAY span multiple datagrams
-  (see §5.7); in **v0.1** every message MUST fit in a single datagram.
+  efficiency. From protocol **v2.0** onward, other message types MAY span multiple datagrams
+  (see §5.7); in **v1.0** every message MUST fit in a single datagram.
 
-**Single client.** The controller serves exactly one client at a time. It learns the client's
+**Single client.** The server serves exactly one client at a time. It learns the client's
 IP address and port from the source of any valid command it receives, and streams telemetry
 back to that address and port. A valid command from a **new** source address/port immediately
-**supersedes** the previous client: the controller aborts any in-progress stream or transfer to
+**supersedes** the previous client: the server aborts any in-progress stream or transfer to
 the old client, resets its session state (including the sequence counter), and re-initializes
 for the new client. There is no multi-client support; the most recent client wins.
 
 ## 3. Message format
 
 A **message** is the logical unit defined here: a fixed header, an optional payload, and a CRC
-trailer, all contiguous with no padding. In **v0.1** a message occupies exactly one UDP
-datagram. In **v1.0** a large message MAY be split across several datagrams on the wire (§5.7);
+trailer, all contiguous with no padding. In **v1.0** a message occupies exactly one UDP
+datagram. In **v2.0** a large message MAY be split across several datagrams on the wire (§5.7);
 the layout below always describes the **reassembled** message.
 
 ```
@@ -59,22 +60,22 @@ the layout below always describes the **reassembled** message.
  14+N     2    CRC-16           (uint16)
 ```
 
-**Header size:** 12 bytes. **Trailer:** 4 bytes, present in every version (CRC unused in v0.1).
+**Header size:** 12 bytes. **Trailer:** 4 bytes.
 
 ### 3.1 Field semantics
 
 | Field | Type | Meaning |
 |---|---|---|
 | **Magic** | 2 bytes | The byte sequence `0x50 0x55` (ASCII "PU"), in this order on the wire — defined as a fixed byte sequence, not an endian-dependent integer. A datagram that does not begin with these bytes MUST be ignored, **except** continuation datagrams of a multi-datagram message in progress (§5.7), which carry raw payload and have no header. Lets a receiver find message boundaries / reject noise. |
-| **Version major** | `uint8` | Incompatible protocol revision. This document covers major `0` and `1`. |
-| **Version minor** | `uint8` | Compatible additions within a major. Combined value is written `major.minor` (e.g. `0.1`, `1.0`). Two different versions are **not** required to be wire-compatible. |
+| **Version major** | `uint8` | Incompatible protocol revision. This document covers major `1` and `2`. |
+| **Version minor** | `uint8` | Compatible additions within a major. Combined value is written `major.minor` (e.g. `1.0`, `2.0`). Two different versions are **not** required to be wire-compatible. |
 | **Type & sequence** | `uint32` | One 32-bit word carrying two sub-fields: **message type** in the high 16 bits, **sequence number** in the low 16 bits — `word = (message_type << 16) \| sequence_number`. |
 | ↳ **Message type** | `uint16` | What the message is / what it commands. See §4. |
-| ↳ **Sequence number** | `uint16` | Per-sender monotonic counter (wraps at 65536), one value **per message**, for stream-level loss detection. For a multi-datagram message (§5.7) it appears once, in the header (first datagram). **v0.1:** sender sets `0`, receiver ignores. **v1.0:** active. |
+| ↳ **Sequence number** | `uint16` | Per-sender monotonic counter (wraps at 65536), one value **per message**, for stream-level loss detection. For a multi-datagram message (§5.7) it appears once, in the header (first datagram). **v1.0:** sender sets `0`, receiver ignores. **v2.0:** active. |
 | **Payload length** | `uint32` | Total number of payload bytes in the message — for a multi-datagram message (§5.7), the sum across all datagrams. MUST be 32-bit word aligned. May be `0`. |
 | **Payload** | bytes | Type-dependent; see §4 and §5. |
 | **Reserved** | `uint16` | Present in every version. Sender sets `0`, reserved for future use. |
-| **CRC-16** | `uint16` | Present in every version. CRC-16 (algorithm in §3.2) over the bytes from Magic through the end of Reserved (i.e. the whole message except the CRC field itself); for a multi-datagram message this covers the **entire reassembled** message. Stored as a `uint16` **little-endian** (low byte at offset 14+N), like every other multi-byte field. **v0.1:** sender sets `0`, receiver ignores. **v1.0:** filled and validated. |
+| **CRC-16** | `uint16` | Present in every version. CRC-16 (algorithm in §3.2) over the bytes from Magic through the end of Reserved (i.e. the whole message except the CRC field itself); for a multi-datagram message this covers the **entire reassembled** message. Stored as a `uint16` **little-endian** (low byte at offset 14+N), like every other multi-byte field. **v1.0:** sender sets `0`, receiver ignores. **v2.0:** filled and validated. |
 
 ### 3.2 CRC-16 algorithm
 
@@ -130,7 +131,7 @@ the acknowledgement that streaming has begun. A client that does not observe the
 a timeout retransmits the request (idempotent: a repeated request simply restarts the same
 transaction).
 
-| Constant | Value (uint16) | Transaction | client → controller | controller → client |
+| Constant | Value (uint16) | Transaction | client → server | server → client |
 |---|---|---|---|---|
 | `DESCRIPTION` | `0x0001` | Get descriptor | request, empty payload | JSON descriptor (see §5), UTF-8, no NUL terminator |
 | `TELEMETRY` | `0x0002` | Telemetry stream | request to start, empty payload | streamed telemetry packets, one or more per datagram (see §5.3), until stopped |
@@ -139,7 +140,7 @@ transaction).
 ### 4.1 Session flow
 
 ```
-client                                      Controller
+client                                      Server
  |  DESCRIPTION (request)  ─────────────────►|   (records client source IP:port)
  |◄────────────  DESCRIPTION (JSON reply)    |   ← response (required)
  |  TELEMETRY (start request)  ─────────────►|
@@ -154,6 +155,8 @@ Every request is answered by a response (the dashed-back arrows). The client rep
 until it observes that response. Because the protocol is explicitly request/response and a
 request and its reply share a message type, the receiver distinguishes them by direction and
 payload — no heuristics.
+
+The protocol design allows client version descovery. Since version 1.0 server ignores the version number for the incoming packets, the client can send `v2.0` request and learn the server protocol version by its reply (§6.1).
 
 ## 5. Payload: telemetry packets and the JSON descriptor
 
@@ -175,7 +178,7 @@ There is a difference in interpretation of JSON descriptor between the protocol 
 
 We detect the telemetry packet size from the number of the data points and their size. The descriptor along with the payload size is sufficient to decode the telemetry payload.
 
-The descriptor also carries a `version` (required) — its own revision in semantic-versioning form, e.g. `1.0.0`. This descriptor version is independent of the protocol version in the message header (§3); it lets a client recognise when the telemetry layout has changed. An optional `id` object may carry controller identification (such as device name, serial number, and firmware version) for display; its inner structure is not yet fixed.
+The descriptor also carries a `version` (required) — its own revision in semantic-versioning form, e.g. `1.0.0`. This descriptor version is independent of the protocol version in the message header (§3); it lets a client recognise when the telemetry layout has changed. An optional `id` object may carry server identification (such as device name, serial number, and firmware version) for display; its inner structure is not yet fixed.
 
 A descriptor MUST validate against the pulseUDP JSON-Schema (draft-07), published alongside
 this document as **`Schema.json`**. That schema is the normative definition of the descriptor
@@ -192,7 +195,7 @@ A worked example descriptor and a validator are provided under `examples/`:
 **Each value occupies an integer number of 32-bit words on the wire.** The value is stored in
 the low bytes of its word span (little-endian); any remaining high bytes are
 sign/zero-extension per the declared type and are ignored by a reader that already knows the
-type. This keeps every field naturally aligned and lets the controller serialize straight
+type. This keeps every field naturally aligned and lets the server serialize straight
 from its in-memory buffer with no packing.
 
 | `type` token | Logical type | Words | Wire bytes |
@@ -233,12 +236,12 @@ So up to **45 telemetry packets per UDP datagram**.
 
 ### 5.5 Units and multipliers
 
-Raw integer values are converted to physical units on the client side using the descriptor as `value × mult` with the given `units` — the controller never converts. `units` may be a raw indication such as
+Raw integer values are converted to physical units on the client side using the descriptor as `value × mult` with the given `units` — the server never converts. `units` may be a raw indication such as
 `ADC counts` or `UsrUnit` when no physical conversion is defined.
 
-### 5.6 Multi-datagram messages (v1.0)
+### 5.6 Multi-datagram messages (v2.0)
 
-In **v0.1** every message MUST fit in a single datagram. From **v1.0** onward a message whose
+In **v1.0** every message MUST fit in a single datagram. From **v2.0** onward a message whose
 payload exceeds the single-datagram budget MAY be split across several datagrams and reassembled
 by the receiver. A multi-datagram message has **one header, one payload, and one trailer** — the
 same layout as §3 — simply spread over consecutive datagrams. There is no per-datagram header.
@@ -267,11 +270,11 @@ CRC-16) ends the last datagram.
 4. verifies the **CRC-16 over the whole reassembled message** and accepts or rejects it.
 
 No per-datagram sequence/offset is needed because the byte count is known in advance and the
-controller sends the pieces back to back.
+server sends the pieces back to back.
 
 **In-order, all-or-nothing.** This scheme assumes the datagrams of one transfer arrive **in
 order**, which the single-client session (§2) and strict request/response (§4) make the normal
-case: the controller emits nothing else between the first datagram and the trailer, and sends a
+case: the server emits nothing else between the first datagram and the trailer, and sends a
 new message only in response to a new request. The receiver cannot reorder headerless pieces, so
 any reordering, loss, or duplication makes the concatenation wrong and the CRC (or the final
 length) **rejects the entire message** — there is no partial recovery or per-datagram
@@ -285,9 +288,9 @@ pieces within it.
 
 ## 6. Version matrix
 
-| Capability | v0.1 (current) | v1.0 (full) |
+| Capability | v1.0 (lite) | v2.0 (full) |
 |---|---|---|
-| Magic / version / type / payload-length header | ✔ | ✔ |
+| Magic / version / type / payload-length header | server sets its version but doesn't check client's version | ✔ |
 | Request/response handshake (`DESCRIPTION` / `TELEMETRY` / `STOP`) | ✔ | ✔ |
 | JSON descriptor + binary packet stream | ✔ | ✔ |
 | Single-client session (new client supersedes the old) | ✔ | ✔ |
@@ -296,13 +299,40 @@ pieces within it.
 | **Multi-datagram messages** (one header/trailer, payload split over datagrams) | not allowed — every message fits one datagram | supported; in-order, all-or-nothing, whole-message CRC |
 | Adaptive / runtime descriptor (runtime substitution of reserved names) | not implemented | candidate (TBD) |
 
-`major.minor` is carried as two bytes (`Version major`, `Version minor`). A receiver MUST
-check the version before parsing further, since major versions are not required to be
-compatible.
+`major.minor` is carried as two bytes (`Version major`, `Version minor`). A client MUST
+read the version before parsing payload semantics, since major versions are not required to be
+wire-compatible in their *payloads*.
+
+A **request**, however, is version-independent above the header: `DESCRIPTION`, `TELEMETRY`,
+and `STOP` requests carry no payload, and the only header fields that differ between v1.0 and
+v2.0 are `sequence_number` and the CRC — which v1.0 already ignores. A server therefore
+MUST answer a well-formed request **regardless of the request's version field**, applying its
+own version's rules, and MUST stamp the response with the **server's own** version. A v1.0
+server in particular ignores the client's version exactly as it ignores the clients's
+sequence and CRC. This is what makes the client-side version discovery in §6.1 a single
+round-trip with no fallback.
+
+### 6.1 Version negotiation (client procedure)
+
+There is no separate negotiation message; the version a session uses is **discovered from the
+`DESCRIPTION` response** and then fixed for the rest of the session:
+
+1. The client sends `DESCRIPTION` framed as the **highest** version it supports (currently
+   **v2.0**: active sequence number + valid CRC).
+2. Every reachable server answers (§6), and the response header carries the server's
+   own version. The client reads that version:
+   - if it is a version the client supports (v1.0 or v2.0), the client **fixates** it and frames
+     all further requests (`TELEMETRY`, `STOP`) accordingly;
+   - if it is a version the client does **not** support, the client reports an incompatible
+     server and does not stream.
+
+Because a v1.0 server validates neither the probe's sequence nor its CRC, and a v2.0
+server validates both (the v2.0 probe satisfies both), the first `DESCRIPTION` always
+elicits a version-revealing reply. The client never has to guess or alternate versions.
 
 ## 7. Open issues
 
-1. **Integrity strength** — the v1.0 trailer carries a 16-bit CRC (CRC-16/CCITT-FALSE, §3.2).
+1. **Integrity strength** — the v2.0 trailer carries a 16-bit CRC (CRC-16/CCITT-FALSE, §3.2).
    For large multi-datagram messages this has a non-negligible chance of accepting a corrupted
    stream. A future major version may widen the trailer to a CRC-32; this would be a
    wire-incompatible change and is therefore deferred to a new `Version major`.
