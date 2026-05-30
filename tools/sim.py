@@ -38,7 +38,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from pulseudp.protocol import (HEADER_SIZE, TRAILER_SIZE, WORD_BYTES,  # noqa: E402
-                               Descriptor, Header, MessageType)
+                               Descriptor, Header, MessageType, crc16_ccitt)
 
 DEFAULT_PORT = 2102
 MTU_BUDGET = 1472
@@ -117,13 +117,22 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
 
     def send(mtype, payload=b""):
         nonlocal seq
-        hdr = Header(message_type=int(mtype), sequence=(seq & 0xFFFF if version[0] >= 1 else 0),
+        # v0.1: sequence sent as 0 (RFC §3.1). v1.0: per-message counter.
+        seq_field = (seq & 0xFFFF) if version[0] >= 1 else 0
+        hdr = Header(message_type=int(mtype), sequence=seq_field,
                      payload_length=len(payload), version=(version[0], version[1]))
-        crc = b"\x00\x00"
-        if version[0] >= 1 and bad_crc:
-            crc = b"\xff\xff"   # deliberately wrong, to exercise the client log path
-        trailer = b"\x00\x00" + crc  # Reserved + CRC-16
-        sock.sendto(hdr.pack() + payload + trailer, client)
+        reserved = b"\x00\x00"
+        framed = hdr.pack() + payload + reserved
+        if version[0] >= 1:
+            # v1.0: real CRC-16/CCITT-FALSE over Magic..end of Reserved (RFC §3.2).
+            crc_val = crc16_ccitt(framed)
+            if bad_crc:
+                crc_val ^= 0xFFFF   # corrupt it to exercise the client's reject path
+            crc = struct.pack("<H", crc_val)
+        else:
+            # v0.1: CRC unused, sent as 0 and ignored by the receiver (RFC §3.1).
+            crc = b"\x00\x00"
+        sock.sendto(framed + crc, client)
         if version[0] >= 1:
             seq = (seq + 1) & 0xFFFF
 
@@ -170,7 +179,9 @@ def main(argv=None) -> int:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--rate", type=float, default=1000.0, help="samples/second")
-    p.add_argument("--version", default="0.1", help="protocol version major.minor")
+    p.add_argument("--version", default="0.1", choices=("0.1", "1.0"),
+                   help="protocol version: 0.1 (seq=0, CRC=0) or 1.0 (active seq, "
+                        "real CRC-16/CCITT-FALSE)")
     p.add_argument("--descriptor", help="path to a descriptor JSON (default: example)")
     p.add_argument("--drop", type=float, default=0.0,
                    help="fraction of datagrams to drop (v1.0 loss test), 0..1")

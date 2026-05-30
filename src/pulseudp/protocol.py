@@ -92,6 +92,24 @@ def frame_size(fields: list[dict]) -> int:
     return sum(TYPE_WORDS[f["type"]] for f in fields) * WORD_BYTES
 
 
+def crc16_ccitt(data: bytes) -> int:
+    """CRC-16/CCITT-FALSE over ``data`` (RFC §3.2).
+
+    Parameters: poly ``0x1021``, init ``0xFFFF``, no input/output reflection,
+    final XOR ``0x0000``. Check value for ``b"123456789"`` is ``0x29B1``.
+    Used for the v1.0 trailer CRC, computed over Magic through end of Reserved
+    (i.e. the whole message except the two CRC bytes). The 16-bit result is
+    stored little-endian in the trailer.
+    """
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+        crc &= 0xFFFF
+    return crc
+
+
 # --- Descriptor and telemetry decoding --------------------------------------
 
 #: descriptor ``type`` token -> little-endian NumPy code. Each value reads from

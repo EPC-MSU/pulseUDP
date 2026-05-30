@@ -4,7 +4,7 @@ import struct
 
 import numpy as np
 
-from pulseudp.protocol import Descriptor, Header, MessageType
+from pulseudp.protocol import Descriptor, Header, MessageType, crc16_ccitt
 
 
 EXAMPLE = {
@@ -71,3 +71,23 @@ def test_header_type_sequence_word_roundtrip():
     assert again.message_type == int(MessageType.TELEMETRY)
     assert again.sequence == 0x1234
     assert again.payload_length == 32
+
+
+def test_crc16_ccitt_check_value():
+    # RFC §3.2 conformance check: CRC-16/CCITT-FALSE of "123456789" is 0x29B1.
+    assert crc16_ccitt(b"123456789") == 0x29B1
+
+
+def test_crc16_ccitt_empty_is_init():
+    # No bytes consumed -> register stays at the init value 0xFFFF.
+    assert crc16_ccitt(b"") == 0xFFFF
+
+
+def test_crc16_ccitt_covers_whole_frame_except_crc():
+    # A valid v1.0 trailer: CRC over Magic..end of Reserved round-trips.
+    hdr = Header(message_type=int(MessageType.TELEMETRY), sequence=7,
+                 payload_length=0, version=(1, 0)).pack()
+    framed = hdr + b"\x00\x00"                 # + empty payload + Reserved
+    crc = crc16_ccitt(framed)
+    datagram = framed + struct.pack("<H", crc)
+    assert crc16_ccitt(datagram[:-2]) == struct.unpack_from("<H", datagram, len(datagram) - 2)[0]
