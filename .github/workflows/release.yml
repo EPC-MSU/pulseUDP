@@ -1,7 +1,8 @@
 name: Release
 
 # Build distributable artifacts on a version tag and attach them to a GitHub
-# Release: a pure-Python wheel + sdist, and a standalone Windows one-folder zip.
+# Release: a pure-Python wheel + sdist, and standalone one-folder builds for
+# Windows (zip) and Linux (tar.gz).
 on:
   push:
     tags:
@@ -45,9 +46,26 @@ jobs:
           name: dist-windows
           path: pulseUDP-windows-x64.zip
 
+  linux-exe:
+    name: Standalone Linux build
+    runs-on: ubuntu-22.04        # older base => broader glibc compatibility
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e .[gui] pyinstaller
+      - run: python -m PyInstaller packaging/pulseudp.spec --noconfirm
+      - name: Tar the one-folder build
+        run: tar -czf pulseUDP-linux-x64.tar.gz -C dist pulseUDP
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: pulseUDP-linux-x64.tar.gz
+
   release:
     name: Publish release
-    needs: [wheel, windows-exe]
+    needs: [wheel, windows-exe, linux-exe]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -60,4 +78,5 @@ jobs:
           files: |
             artifacts/dist-python/*
             artifacts/dist-windows/*
+            artifacts/dist-linux/*
           generate_release_notes: true

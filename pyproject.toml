@@ -40,10 +40,12 @@ dev = [
     "pytest",
     "numpy>=1.21",
 ]
-# Tools for producing distributable artifacts (wheel/sdist + standalone exe).
+# Tools for producing distributable artifacts (wheel/sdist + standalone exe) and
+# cutting a release (bump2version updates the version + tags; see README).
 package = [
     "build",
     "pyinstaller>=6",
+    "bump2version",
 ]
 
 # gui-scripts (not scripts): on Windows this launcher has no attached console
