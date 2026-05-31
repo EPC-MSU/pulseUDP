@@ -95,21 +95,38 @@ class PlotModel:
     def extract(self, packets: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
         """Flatten a decoded packet array into (time, {trace_key: values}).
 
-        ``time`` is the time-base field converted to seconds (its ``mult`` is
-        already applied by :meth:`Descriptor.channels`). Bitfields are expanded
-        into 0/1 bit traces.
+        Decoded against the full descriptor, so the time base is always present.
         """
-        ch = self.descriptor.channels(packets)
-        t = ch[self.descriptor.timestamp_field.name].astype(np.float64)
+        t, flat = self.flatten(self.descriptor.channels(packets))
+        assert t is not None        # full descriptor always carries the time base
+        return t, flat
+
+    def flatten(self, channels: Dict[str, np.ndarray]
+                ) -> Tuple[Optional[np.ndarray], Dict[str, np.ndarray]]:
+        """Map per-field channel arrays to (time, {trace_key: values}).
+
+        ``channels`` is :meth:`Descriptor.channels` output — physical-unit arrays
+        keyed by field name, possibly covering only a v2.0 *enabled* subset. Time
+        is the time-base field in seconds; bitfields are expanded into 0/1 bit
+        traces. Fields absent from ``channels`` (disabled channels) are skipped —
+        the RingBuffer fills their keys with NaN, so they draw as gaps. Returns
+        ``(None, {})`` if the time-base channel itself is absent.
+        """
+        t = channels.get(self.descriptor.timestamp_field.name)
+        if t is None:
+            return None, {}
+        t = t.astype(np.float64)
 
         flat: Dict[str, np.ndarray] = {}
         for f in self.descriptor.plot_fields:
+            col = channels.get(f.name)
+            if col is None:
+                continue   # disabled channel (v2.0): omitted -> NaN in the buffer
             if f.is_bitfield:
-                traces = Descriptor.bit_traces(f, ch[f.name])
-                for name, arr in traces.items():
+                for name, arr in Descriptor.bit_traces(f, col).items():
                     flat["{}.{}".format(f.name, name)] = arr.astype(np.float64)
             else:
-                flat[f.name] = ch[f.name]
+                flat[f.name] = col
         return t, flat
 
 

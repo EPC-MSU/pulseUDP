@@ -48,7 +48,8 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from pulseudp.protocol import (HEADER_SIZE, TRAILER_SIZE, WORD_BYTES,  # noqa: E402
-                               Descriptor, Header, MessageType, crc16_ccitt)
+                               Descriptor, Header, MessageType, crc16_ccitt,
+                               decode_channel_bitmap, encode_channel_bitmap)
 
 DEFAULT_PORT = 2102
 MTU_BUDGET = 1472
@@ -76,34 +77,6 @@ def _encode_value(field, value: float) -> bytes:
     if t == "double":
         return struct.pack("<d", float(value))
     raise ValueError("unknown type " + t)
-
-
-def _encode_channels(enabled) -> bytes:
-    """Pack enabled-channel flags into the RFC §4 channel bitmap.
-
-    ⌈N/32⌉ ``uint32`` words sent **most-significant word first**; channel ``c``
-    (0-based, descriptor order) is bit ``c`` of the whole integer, so channel 0
-    is the LSB of the *last* word. Bytes within each word stay little-endian.
-    """
-    n = len(enabled)
-    nwords = (n + 31) // 32 or 1
-    words = [0] * nwords            # words[0] = least-significant (channels 0..31)
-    for c, on in enumerate(enabled):
-        if on:
-            words[c >> 5] |= 1 << (c & 31)
-    return b"".join(struct.pack("<I", w) for w in reversed(words))
-
-
-def _decode_channels(payload: bytes, n: int):
-    """Inverse of :func:`_encode_channels`: bitmap bytes -> list of ``n`` bools."""
-    wire = [struct.unpack_from("<I", payload, i * 4)[0]
-            for i in range(len(payload) // 4)]
-    words = list(reversed(wire))    # words[0] = least-significant
-    out = []
-    for c in range(n):
-        w = words[c >> 5] if (c >> 5) < len(words) else 0
-        out.append(bool((w >> (c & 31)) & 1))
-    return out
 
 
 def _sample(descriptor: Descriptor, n: int, enabled=None):
@@ -278,15 +251,15 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
             elif mtype == MessageType.GET_CHANNELS and version[0] >= 2:
                 # Report the currently enabled channels (RFC §4). v2.0 only;
                 # a v1.0 server has no channel selection and ignores this.
-                send(MessageType.GET_CHANNELS, _encode_channels(enabled))
+                send(MessageType.GET_CHANNELS, encode_channel_bitmap(enabled))
             elif mtype == MessageType.SET_CHANNELS and version[0] >= 2:
                 # Accept the requested subset verbatim (the sim has no resource
                 # limits) and echo back the set actually in effect (RFC §4).
-                enabled[:] = _decode_channels(payload, n_channels)
+                enabled[:] = decode_channel_bitmap(payload, n_channels)
                 recompute_layout()
                 print("channels set -> {}/{} enabled  packet={} B".format(
                     sum(enabled), n_channels, packet_size))
-                send(MessageType.SET_CHANNELS, _encode_channels(enabled))
+                send(MessageType.SET_CHANNELS, encode_channel_bitmap(enabled))
         except socket.timeout:
             pass
 

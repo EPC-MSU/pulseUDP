@@ -17,12 +17,13 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .protocol import (HEADER_SIZE, TRAILER_SIZE, Descriptor, Header,
-                       MessageType, crc16_ccitt)
+                       MessageType, crc16_ccitt, decode_channel_bitmap,
+                       encode_channel_bitmap)
 
 DEFAULT_PORT = 2102
 #: Protocol versions this client understands, highest first. The first entry is
@@ -45,7 +46,7 @@ class LogEvent:
 
 
 # Callback type aliases (documentation only).
-TelemetryCb = Callable[[np.ndarray], None]   # receives a decoded packet array
+TelemetryCb = Callable[[Dict[str, np.ndarray]], None]  # per-field physical arrays
 LogCb = Callable[[LogEvent], None]
 StateCb = Callable[[str, str], None]          # (state, detail)
 
@@ -85,8 +86,9 @@ class UdpClient:
         against it before use.
     on_telemetry, on_log, on_state:
         Callbacks. ``on_telemetry`` is invoked from the receiver thread with a
-        decoded packet array; keep it cheap and thread-safe (the GUI appends to
-        a thread-safe ``RingBuffer``).
+        dict of per-field physical-unit arrays (``{field_name: ndarray}``) for
+        the enabled channels; keep it cheap and thread-safe (the GUI flattens it
+        and appends to a thread-safe ``RingBuffer``).
     """
 
     def __init__(self, host: str, port: int = DEFAULT_PORT,
@@ -104,6 +106,11 @@ class UdpClient:
         self._on_state = on_state
 
         self.descriptor: Optional[Descriptor] = None
+        # v2.0 channel selection (RFC §4): which descriptor channels are enabled,
+        # and the descriptor used to decode telemetry — the full descriptor, or a
+        # subset matching the enabled channels' on-wire packet layout.
+        self.enabled_channels: Optional[List[bool]] = None
+        self._active_descriptor: Optional[Descriptor] = None
 
         self._sock: Optional[socket.socket] = None
         self._rx_thread: Optional[threading.Thread] = None
@@ -113,6 +120,9 @@ class UdpClient:
         # DESCRIPTION carries (reply_version, payload) so the caller can fixate
         # the negotiated protocol version (RFC §6.1).
         self._desc_q: "queue.Queue[Tuple[Tuple[int, int], bytes]]" = queue.Queue()
+        # GET_CHANNELS / SET_CHANNELS responses both carry a channel bitmap (RFC §4);
+        # the two are serialized request/response transactions, so one queue serves.
+        self._chan_q: "queue.Queue[bytes]" = queue.Queue()
         self._stop_ack = threading.Event()
         self._stream_started = threading.Event()
 
@@ -192,6 +202,9 @@ class UdpClient:
             descriptor = Descriptor.from_json(
                 payload, schema=self.schema, validate=self.schema is not None)
             self.descriptor = descriptor
+            # Start with every channel enabled (v1.0 immutable; v2.0 until the
+            # caller narrows it via set_channels). Decode against the full layout.
+            self._set_active([True] * len(descriptor.fields))
             self._emit_state("connected",
                              "protocol v{}.{} · descriptor v{} · {} fields".format(
                                  self.version[0], self.version[1],
@@ -230,6 +243,79 @@ class UdpClient:
                       "STOP ack timeout, retry {}/{}".format(attempt + 1, retries))
         self._streaming = False
         self._emit_state("stopped", "")
+
+    # -- channel selection (v2.0, RFC §4) -------------------------------------
+
+    def get_channels(self, timeout: float = 1.0, retries: int = 3) -> List[bool]:
+        """Read the enabled-channel set (RFC §4), one bool per descriptor field.
+
+        v1.0 has no selection — every channel is enabled and immutable, so this
+        returns all-``True`` without touching the wire.
+        """
+        self._require_open()
+        if self.descriptor is None:
+            raise RuntimeError("request the descriptor before reading channels")
+        n = len(self.descriptor.fields)
+        if self.version[0] < 2:
+            self._set_active([True] * n)
+            return list(self.enabled_channels or [])
+        self._drain(self._chan_q)
+        for attempt in range(retries):
+            self._send(MessageType.GET_CHANNELS)
+            try:
+                payload = self._chan_q.get(timeout=timeout)
+            except queue.Empty:
+                self._log("info", "info",
+                          "GET_CHANNELS timeout, retry {}/{}".format(attempt + 1, retries))
+                continue
+            enabled = decode_channel_bitmap(payload, n)
+            self._set_active(enabled)
+            return enabled
+        raise TimeoutError("no GET_CHANNELS response after {} attempts".format(retries))
+
+    def set_channels(self, enabled, timeout: float = 1.0,
+                     retries: int = 3) -> List[bool]:
+        """Request an enabled-channel set; return the set the server accepted.
+
+        The server may refuse or alter the request (RFC §4), so the returned list
+        — not the requested one — is authoritative and becomes the decode layout.
+        v1.0 has no selection: returns all-``True`` and sends nothing.
+        """
+        self._require_open()
+        if self.descriptor is None:
+            raise RuntimeError("request the descriptor before setting channels")
+        n = len(self.descriptor.fields)
+        if self.version[0] < 2:
+            self._set_active([True] * n)
+            return list(self.enabled_channels or [])
+        payload = encode_channel_bitmap([bool(x) for x in enabled])
+        self._drain(self._chan_q)
+        for attempt in range(retries):
+            self._send(MessageType.SET_CHANNELS, payload)
+            try:
+                reply = self._chan_q.get(timeout=timeout)
+            except queue.Empty:
+                self._log("info", "info",
+                          "SET_CHANNELS timeout, retry {}/{}".format(attempt + 1, retries))
+                continue
+            accepted = decode_channel_bitmap(reply, n)
+            self._set_active(accepted)
+            return accepted
+        raise TimeoutError("no SET_CHANNELS response after {} attempts".format(retries))
+
+    def _set_active(self, enabled: List[bool]) -> None:
+        """Record the enabled set and the descriptor used to decode telemetry.
+
+        With every channel enabled the full descriptor is used; otherwise a
+        :meth:`Descriptor.subset` matching the enabled channels' packet layout.
+        """
+        self.enabled_channels = list(enabled)
+        if self.descriptor is None or all(enabled):
+            self._active_descriptor = self.descriptor
+        else:
+            idx = [i for i, on in enumerate(enabled) if on]
+            self._active_descriptor = (self.descriptor.subset(idx) if idx
+                                       else self.descriptor)
 
     # -- receiver thread ------------------------------------------------------
 
@@ -344,6 +430,10 @@ class UdpClient:
         if mtype == MessageType.DESCRIPTION:
             # Forward the reply's version so the caller can fixate it (RFC §6.1).
             self._desc_q.put((header.version, payload))
+        elif mtype in (MessageType.GET_CHANNELS, MessageType.SET_CHANNELS):
+            # Both responses carry the channel bitmap (RFC §4); hand it to the
+            # waiting get_channels/set_channels caller.
+            self._chan_q.put(payload)
         elif mtype == MessageType.STOP:
             self._stop_ack.set()
         elif mtype == MessageType.TELEMETRY:
@@ -355,19 +445,26 @@ class UdpClient:
                       "unknown message type 0x{:04x}".format(mtype))
 
     def _dispatch_telemetry(self, payload: bytes) -> None:
-        if self.descriptor is None or self._on_telemetry is None:
+        # Decode against the *active* descriptor: the full layout, or a subset
+        # matching the v2.0 enabled channels (RFC §4) — the packet on the wire
+        # carries only the enabled fields.
+        dd = self._active_descriptor or self.descriptor
+        if dd is None or self._on_telemetry is None:
             return
-        if len(payload) % self.descriptor.packet_size != 0:
+        if dd.packet_size == 0:
+            return                      # no channels enabled -> nothing to decode
+        if len(payload) % dd.packet_size != 0:
             # Trailing pad is allowed (RFC §5.3); only flag a non-integer count
             # that also leaves no whole packets.
-            if self.descriptor.packets_in(len(payload)) == 0:
+            if dd.packets_in(len(payload)) == 0:
                 self._log("decode", "warning",
                           "telemetry payload {} B < packet size {} B".format(
-                              len(payload), self.descriptor.packet_size))
+                              len(payload), dd.packet_size))
                 return
-        packets = self.descriptor.decode(payload)
+        packets = dd.decode(payload)
         if packets.size:
-            self._on_telemetry(packets)
+            # Deliver per-field physical arrays (only the enabled channels).
+            self._on_telemetry(dd.channels(packets))
 
     def _crc_ok(self, data: bytes) -> bool:
         """True if the trailer CRC-16 matches (RFC §3.2 covers Magic..Reserved)."""

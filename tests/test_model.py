@@ -49,6 +49,32 @@ def test_extract_returns_time_and_bit_traces():
     assert np.array_equal(flat["Flags.Fault"], [1.0])
 
 
+def test_flatten_subset_omits_disabled_then_ring_fills_nan():
+    # v2.0: only some channels enabled -> flatten yields only those; the buffer
+    # fills the disabled trace keys with NaN so they draw as gaps.
+    d = Descriptor.from_json(DESC)
+    model = PlotModel(d)
+    channels = {"Timestamp": np.array([1.0, 2.0]),
+                "VoltageA": np.array([0.1, 0.2])}     # VoltageB/Speed/Flags off
+    t, flat = model.flatten(channels)
+    assert t is not None
+    assert np.allclose(t, [1.0, 2.0])
+    assert set(flat) == {"VoltageA"}
+    rb = RingBuffer(model.channel_keys)
+    rb.append(t, flat)
+    _, chans = rb.snapshot()
+    assert np.allclose(chans["VoltageA"], [0.1, 0.2])
+    assert np.all(np.isnan(chans["VoltageB"]))        # disabled numeric -> NaN
+    assert np.all(np.isnan(chans["Flags.Run"]))       # disabled bitfield -> NaN
+
+
+def test_flatten_without_timebase_returns_none():
+    d = Descriptor.from_json(DESC)
+    model = PlotModel(d)
+    t, flat = model.flatten({"VoltageA": np.array([1.0])})
+    assert t is None and flat == {}
+
+
 def test_ring_buffer_trims_to_window():
     rb = RingBuffer(["a"], window_s=1.0)
     for i in range(10):

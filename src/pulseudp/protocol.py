@@ -94,6 +94,35 @@ def frame_size(fields: list[dict]) -> int:
     return sum(TYPE_WORDS[f["type"]] for f in fields) * WORD_BYTES
 
 
+def encode_channel_bitmap(enabled: List[bool]) -> bytes:
+    """Pack channel-enable flags into the RFC §4 channel bitmap (v2.0).
+
+    ⌈N/32⌉ ``uint32`` words sent **most-significant word first**; channel ``c``
+    (0-based, descriptor order) is bit ``c`` of the whole integer, so channel 0
+    is the LSB of the *last* word. Bytes within each word stay little-endian —
+    the one exception to the little-endian rule of §2.
+    """
+    n = len(enabled)
+    nwords = (n + 31) // 32 or 1
+    words = [0] * nwords            # words[0] = least-significant (channels 0..31)
+    for c, on in enumerate(enabled):
+        if on:
+            words[c >> 5] |= 1 << (c & 31)
+    return b"".join(struct.pack("<I", w) for w in reversed(words))
+
+
+def decode_channel_bitmap(payload: bytes, n: int) -> List[bool]:
+    """Inverse of :func:`encode_channel_bitmap`: bitmap bytes -> ``n`` bools."""
+    wire = [struct.unpack_from("<I", payload, i * 4)[0]
+            for i in range(len(payload) // 4)]
+    words = list(reversed(wire))    # words[0] = least-significant
+    out = []
+    for c in range(n):
+        w = words[c >> 5] if (c >> 5) < len(words) else 0
+        out.append(bool((w >> (c & 31)) & 1))
+    return out
+
+
 def crc16_ccitt(data: bytes) -> int:
     """CRC-16/CCITT-FALSE over ``data`` (RFC §3.2).
 
@@ -224,6 +253,16 @@ class Descriptor:
         ]
         return cls(fields=fields, version=obj["version"],
                    id=obj.get("id"), raw=obj)
+
+    def subset(self, indices: List[int]) -> "Descriptor":
+        """A descriptor with only ``indices`` (ascending, descriptor order).
+
+        Used to decode a v2.0 telemetry packet that carries only the enabled
+        channels (RFC §4): the sub-descriptor's packet layout matches the wire.
+        """
+        fields = [self.fields[i] for i in indices]
+        return Descriptor(fields=fields, version=self.version,
+                          id=self.id, raw=self.raw)
 
     # -- decoding -------------------------------------------------------------
 

@@ -71,6 +71,7 @@ class _Bridge(QtCore.QObject):
     log = QtCore.pyqtSignal(object)         # LogEvent
     state = QtCore.pyqtSignal(str, str)     # (state, detail)
     descriptor = QtCore.pyqtSignal(object)  # Descriptor (on connect)
+    channels = QtCore.pyqtSignal(object)    # List[bool] enabled-channel set (v2.0)
     error = QtCore.pyqtSignal(str)
 
 
@@ -121,10 +122,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._curves: Dict[str, pg.PlotDataItem] = {}
         self._bit_offset: Dict[str, int] = {}   # bit trace key -> stack row
 
+        # v2.0 channel selection: a checkbox per selectable channel, keyed by its
+        # descriptor field index. Selection is only possible in v2.0 and only while
+        # the stream is stopped (RFC §4); v1.0 keeps the boxes checked and greyed.
+        self._channel_checks: Dict[int, QtWidgets.QCheckBox] = {}
+        self._selectable = False        # True once a v2.0 session is negotiated
+        self._suppress_check = False    # guard against re-entrant checkbox updates
+        self._n_channels = 0
+        self._ts_index = 0              # time-base channel: always kept enabled
+
         self._bridge = _Bridge()
         self._bridge.log.connect(self._on_log)
         self._bridge.state.connect(self._on_state)
         self._bridge.descriptor.connect(self._on_descriptor)
+        self._bridge.channels.connect(self._on_channels_result)
         self._bridge.error.connect(self._on_error)
 
         self._build_ui()
@@ -246,6 +257,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._running = False
         self._start_btn.setText("Start")
         self._start_btn.setEnabled(False)
+        # Neutralize channel selection until the new descriptor/version is known
+        # (avoids a stale checkbox from the old session pushing SET_CHANNELS).
+        self._selectable = False
+        self._set_checks_enabled(False)
 
         # No version selector: the client probes at v2.0 and adopts whatever
         # version the server reveals in its DESCRIPTION reply (RFC §6.1).
@@ -291,8 +306,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_descriptor(self, descriptor: Descriptor) -> None:
         self._model = PlotModel(descriptor)
         self._ring = RingBuffer(self._model.channel_keys, window_s=self._history_s)
+        self._n_channels = len(descriptor.fields)
+        self._ts_index = descriptor.timestamp_index
+        # Channel selection is a v2.0 feature; in v1.0 the list is immutable.
+        self._selectable = (self._client is not None
+                            and self._client.version[0] >= 2)
         self._build_plots(descriptor)
         self._start_btn.setEnabled(True)
+        # v2.0: read the server's current enabled set and reflect it (RFC §4).
+        if self._selectable and self._client is not None:
+            client = self._client
+
+            def work():
+                try:
+                    enabled = client.get_channels(timeout=1.0, retries=3)
+                    self._bridge.channels.emit(enabled)
+                except Exception as exc:  # noqa: BLE001
+                    self._bridge.error.emit(str(exc))
+
+            self._run_async(work)
 
     def _on_state(self, state: str, detail: str) -> None:
         label = state.capitalize()
@@ -302,9 +334,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if state == "streaming":
             self._running = True
             self._start_btn.setText("Stop")
+            self._set_checks_enabled(False)   # can't change channels mid-stream
         elif state in ("stopped", "disconnected", "error"):
             self._running = False
             self._start_btn.setText("Start")
+            self._set_checks_enabled(True)     # selectable again once stopped
 
     def _on_error(self, message: str) -> None:
         self._append_log("error", message)
@@ -319,11 +353,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- telemetry ingest (receiver thread) -----------------------------------
 
-    def _on_telemetry(self, packets: np.ndarray) -> None:
+    def _on_telemetry(self, channels: Dict[str, np.ndarray]) -> None:
         # Runs on the client's receiver thread; RingBuffer is thread-safe.
+        # ``channels`` covers only the enabled fields (v2.0 subset); flatten maps
+        # them to trace keys and the RingBuffer fills disabled ones with NaN.
         if self._model is None or self._ring is None:
             return
-        t, flat = self._model.extract(packets)
+        t, flat = self._model.flatten(channels)
+        if t is None:
+            return
         self._ring.append(t, flat)
 
     # -- plot building & redraw -----------------------------------------------
@@ -334,9 +372,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plots = []
         self._curves = {}
         self._bit_offset = {}
+        self._channel_checks = {}
         self._link_vb = None
         color_i = 0
         ts_name = descriptor.timestamp_field.name
+        # Field name -> descriptor index (= channel index in the bitmap, RFC §4).
+        index_by_name = {f.name: i for i, f in enumerate(descriptor.fields)}
 
         # Telemetry tree: timestamp first (as time base, no checkbox), then fields.
         ts_item = QtWidgets.QTreeWidgetItem(
@@ -381,7 +422,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Tree: bitfield field with its bits as children.
                 fld = field_by_name.get(group.title)
                 parent = self._add_field_row(group.title,
-                                             fld.type if fld else "bitfield", None)
+                                             fld.type if fld else "bitfield", None,
+                                             index_by_name.get(group.title))
                 for bi, tr in enumerate(group.traces):
                     child = QtWidgets.QTreeWidgetItem(["", tr.label, "bit"])
                     child.setIcon(1, self._swatch(_PALETTE[
@@ -395,17 +437,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     curve = plot.plot(pen=pg.mkPen(color, width=2), name=tr.label)
                     self._curves[tr.key] = curve
                     fld = field_by_name.get(tr.key)
-                    self._add_field_row(tr.label, fld.type if fld else "", color)
+                    self._add_field_row(tr.label, fld.type if fld else "", color,
+                                        index_by_name.get(tr.key))
 
         self._tree.expandToDepth(0)
 
-    def _add_field_row(self, name: str, type_str: str,
-                       color: Optional[str]) -> QtWidgets.QTreeWidgetItem:
-        """Add a top-level field row with a disabled (greyed) checkbox.
+    def _add_field_row(self, name: str, type_str: str, color: Optional[str],
+                       field_index: Optional[int]) -> QtWidgets.QTreeWidgetItem:
+        """Add a top-level field row with its channel-enable checkbox.
 
-        Only the checkbox is disabled — it is reserved for the future
-        field-selection feature — while the name/type text stays enabled and
-        normally coloured.
+        The checkbox is live only in v2.0 and only while the stream is stopped
+        (RFC §4 channel selection); in v1.0 it stays checked and greyed because
+        the channel list is immutable.
         """
         item = QtWidgets.QTreeWidgetItem(["", name, type_str])
         if color:
@@ -413,10 +456,57 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tree.addTopLevelItem(item)
         check = QtWidgets.QCheckBox()
         check.setChecked(True)
-        check.setEnabled(False)      # greyed; the row text remains enabled
-        check.setToolTip("Reserved for future telemetry-field selection")
+        check.setEnabled(self._selectable and not self._running)
+        check.setToolTip(
+            "Enable/disable this channel (stop the stream to change)"
+            if self._selectable else
+            "Channel selection is a v2.0 feature; v1.0 channels are fixed")
+        check.stateChanged.connect(self._on_channel_toggled)
         self._tree.setItemWidget(item, 0, check)
+        if field_index is not None:
+            self._channel_checks[field_index] = check
         return item
+
+    # -- channel selection (v2.0, RFC §4) -------------------------------------
+
+    def _set_checks_enabled(self, on: bool) -> None:
+        """Enable/disable every channel checkbox (no-op unless v2.0)."""
+        enabled = bool(on) and self._selectable
+        for chk in self._channel_checks.values():
+            chk.setEnabled(enabled)
+
+    def _on_channel_toggled(self, _state: int = 0) -> None:
+        """A channel checkbox changed: push the new selection with SET_CHANNELS."""
+        if (self._suppress_check or not self._selectable or self._running
+                or self._client is None):
+            return
+        desired = [True] * self._n_channels
+        for idx, chk in self._channel_checks.items():
+            desired[idx] = chk.isChecked()
+        desired[self._ts_index] = True      # the time base must stay enabled
+        self._set_checks_enabled(False)      # lock the boxes during the round trip
+        client = self._client
+
+        def work():
+            try:
+                accepted = client.set_channels(desired, timeout=1.0, retries=3)
+                self._bridge.channels.emit(accepted)
+            except Exception as exc:  # noqa: BLE001
+                self._bridge.error.emit(str(exc))
+
+        self._run_async(work)
+
+    def _on_channels_result(self, enabled) -> None:
+        """Reflect the server's authoritative enabled set in the checkboxes."""
+        self._suppress_check = True         # programmatic update: don't re-emit
+        try:
+            for idx, chk in self._channel_checks.items():
+                chk.setChecked(bool(idx < len(enabled) and enabled[idx]))
+        finally:
+            self._suppress_check = False
+        if self._ring is not None:
+            self._ring.clear()              # packet layout changed; drop stale data
+        self._set_checks_enabled(not self._running)
 
     @staticmethod
     def _swatch(color: str) -> QtGui.QIcon:

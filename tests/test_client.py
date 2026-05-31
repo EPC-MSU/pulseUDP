@@ -12,7 +12,8 @@ import time
 import pytest
 
 from pulseudp.client import PROBE_VERSION, UdpClient
-from pulseudp.protocol import Header, MessageType, crc16_ccitt
+from pulseudp.protocol import (Descriptor, Header, MessageType, crc16_ccitt,
+                               encode_channel_bitmap)
 
 # Minimal structurally-valid descriptor for the negotiation tests (schema=None,
 # so it is parsed but not schema-validated).
@@ -198,6 +199,60 @@ def test_v01_never_reassembles():
     msg = _datagram(MessageType.DESCRIPTION, 0, (1, 0), payload=_BIG_PAYLOAD)
     c._handle_datagram(_split(msg, 3)[0])                   # only the first piece
     assert c._reasm is None                                 # no reassembly state
+
+
+# -- channel selection (RFC §4, v2.0) -----------------------------------------
+
+def _channel_client(reply_enabled, version=(2, 0)):
+    """A v2.0 client whose ``_send`` answers GET/SET_CHANNELS with a canned bitmap.
+
+    The descriptor is the 2-field ``_DESC_JSON`` (Timestamp, V), so a reply of
+    ``[True, False]`` enables only the time base.
+    """
+    c = UdpClient("127.0.0.1", version=version)
+    c._sock = _FakeSock()
+    c.version = version
+    c.descriptor = Descriptor.from_json(_DESC_JSON)
+    c._set_active([True] * len(c.descriptor.fields))
+
+    def fake_send(mtype, payload=b""):
+        if mtype in (MessageType.GET_CHANNELS, MessageType.SET_CHANNELS):
+            bm = encode_channel_bitmap(reply_enabled)
+            c._handle_datagram(_datagram(mtype, 0, version, payload=bm))
+
+    c._send = fake_send
+    return c
+
+
+def test_get_channels_reads_bitmap_and_sets_active_subset():
+    c = _channel_client([True, False])              # only the time base enabled
+    enabled = c.get_channels(timeout=0.3, retries=2)
+    assert enabled == [True, False]
+    assert c.enabled_channels == [True, False]
+    # active descriptor is now the 1-field subset used to decode telemetry
+    assert [f.name for f in c._active_descriptor.fields] == ["Timestamp"]
+
+
+def test_set_channels_returns_server_accepted_set():
+    # Client asks for both; server accepts only the first — the reply wins.
+    c = _channel_client([True, False])
+    accepted = c.set_channels([True, True], timeout=0.3, retries=2)
+    assert accepted == [True, False]                 # server's set, not requested
+    assert c.enabled_channels == [True, False]
+    assert [f.name for f in c._active_descriptor.fields] == ["Timestamp"]
+
+
+def test_all_enabled_uses_full_descriptor():
+    c = _channel_client([True, True])
+    c.set_channels([True, True], timeout=0.3, retries=2)
+    assert c._active_descriptor is c.descriptor     # no subset when all enabled
+
+
+def test_v01_channels_are_immutable_and_offline():
+    c = _channel_client([True, False], version=(1, 0))
+    assert c.get_channels() == [True, True]          # all enabled, immutable
+    assert c.set_channels([False, False]) == [True, True]
+    assert c._sock.sent == []                        # nothing put on the wire
 
 
 # -- version negotiation (RFC §6.1) -------------------------------------------

@@ -4,7 +4,8 @@ import struct
 
 import numpy as np
 
-from pulseudp.protocol import Descriptor, Header, MessageType, crc16_ccitt
+from pulseudp.protocol import (Descriptor, Header, MessageType, crc16_ccitt,
+                               decode_channel_bitmap, encode_channel_bitmap)
 
 
 EXAMPLE = {
@@ -62,6 +63,40 @@ def test_bit_traces_skip_reserved():
     assert set(traces) == {"Run", "Fault"}               # Reserved (bit 1) dropped
     assert np.array_equal(traces["Run"], [1, 0])
     assert np.array_equal(traces["Fault"], [1, 1])       # bit 2
+
+
+def test_descriptor_subset_matches_wire_layout():
+    # A v2.0 subset packet carries only the enabled fields, packed contiguously.
+    d = Descriptor.from_json(EXAMPLE)
+    sub = d.subset([0, 1, 4])                       # Timestamp, VoltageA, Counter
+    assert [f.name for f in sub.fields] == ["Timestamp", "VoltageA", "Counter"]
+    assert sub.packet_size == 3 * 4
+    payload = (struct.pack("<I", 1000)              # Timestamp
+               + struct.pack("<hh", 250, 0)         # VoltageA
+               + struct.pack("<i", -42))            # Counter
+    ch = sub.channels(sub.decode(payload))
+    assert np.allclose(ch["Timestamp"], [1.0])
+    assert np.allclose(ch["VoltageA"], [2.5])
+    assert np.allclose(ch["Counter"], [-42.0])
+    assert "Current" not in ch                      # disabled field absent
+
+
+def test_channel_bitmap_roundtrip_and_lsb_is_channel_zero():
+    enabled = [True, False, True] + [False] * 5     # channels 0 and 2 of 8
+    bm = encode_channel_bitmap(enabled)
+    assert bm == struct.pack("<I", 0b101)           # one word, ch0=LSB
+    assert decode_channel_bitmap(bm, 8) == enabled
+
+
+def test_channel_bitmap_is_most_significant_word_first():
+    # 40 channels -> 2 words; channel 0 in the LAST word, channel 33 in the first.
+    enabled = [False] * 40
+    enabled[0] = True       # bit 0 of the least-significant (last) word
+    enabled[33] = True      # bit 1 of the most-significant (first) word
+    bm = encode_channel_bitmap(enabled)
+    words = [struct.unpack_from("<I", bm, i * 4)[0] for i in range(2)]
+    assert words == [0x2, 0x1]                      # MSW-first on the wire
+    assert decode_channel_bitmap(bm, 40) == enabled
 
 
 def test_header_type_sequence_word_roundtrip():
