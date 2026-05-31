@@ -42,6 +42,8 @@ class MessageType(IntEnum):
     DESCRIPTION = 0x0001  # request descriptor / reply with JSON descriptor
     TELEMETRY = 0x0002    # request to start streaming / streamed telemetry frames
     STOP = 0x0003         # request to stop streaming / optional ack
+    GET_CHANNELS = 0x0004  # v2.0: read the enabled-channel bitmap (RFC §4)
+    SET_CHANNELS = 0x0005  # v2.0: set the enabled-channel bitmap (RFC §4)
 
 
 #: On-wire footprint of each descriptor type, in 32-bit words.
