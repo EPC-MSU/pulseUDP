@@ -72,8 +72,11 @@ def _encode_value(field, value: float) -> bytes:
     if t == "float":
         return struct.pack("<f", float(value))
     if t in ("int64", "uint64"):
-        code = "<q" if t == "int64" else "<Q"
-        return struct.pack(code, int(value))
+        if t == "uint64":
+            # Mask to the unsigned range: the synthetic generator can yield a
+            # negative sample, which "<Q" would reject (mirrors the uint32 path).
+            return struct.pack("<Q", int(value) & 0xFFFFFFFFFFFFFFFF)
+        return struct.pack("<q", int(value))
     if t == "double":
         return struct.pack("<d", float(value))
     raise ValueError("unknown type " + t)
