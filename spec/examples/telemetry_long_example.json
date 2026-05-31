@@ -1,0 +1,196 @@
+{
+  "version": "1.0.0",
+  "id": {
+    "model": "pulseUDP reference power analyzer",
+    "channels": 3
+  },
+  "fields": [
+    {
+      "name": "Timestamp",
+      "type": "uint32",
+      "mult": 0.001,
+      "units": "s"
+    },
+    {
+      "name": "Voltage1A",
+      "type": "int16",
+      "mult": 0.01,
+      "units": "V"
+    },
+    {
+      "name": "Current1A",
+      "type": "int16",
+      "mult": 0.001,
+      "units": "A"
+    },
+    {
+      "name": "Voltage1B",
+      "type": "int16",
+      "mult": 0.01,
+      "units": "V"
+    },
+    {
+      "name": "Current1B",
+      "type": "int16",
+      "mult": 0.001,
+      "units": "A"
+    },
+    {
+      "name": "Voltage1C",
+      "type": "int16",
+      "mult": 0.01,
+      "units": "V"
+    },
+    {
+      "name": "Current1C",
+      "type": "int16",
+      "mult": 0.001,
+      "units": "A"
+    },
+    {
+      "name": "Power1",
+      "type": "int32",
+      "mult": 0.001,
+      "units": "W"
+    },
+    {
+      "name": "Temp1",
+      "type": "int16",
+      "mult": 0.1,
+      "units": "degC"
+    },
+    {
+      "name": "Voltage2A",
+      "type": "int16",
+      "mult": 0.01,
+      "units": "V"
+    },
+    {
+      "name": "Current2A",
+      "type": "int16",
+      "mult": 0.001,
+      "units": "A"
+    },
+    {
+      "name": "Voltage2B",
+      "type": "int16",
+      "mult": 0.01,
+      "units": "V"
+    },
+    {
+      "name": "Current2B",
+      "type": "int16",
+      "mult": 0.001,
+      "units": "A"
+    },
+    {
+      "name": "Voltage2C",
+      "type": "int16",
+      "mult": 0.01,
+      "units": "V"
+    },
+    {
+      "name": "Current2C",
+      "type": "int16",
+      "mult": 0.001,
+      "units": "A"
+    },
+    {
+      "name": "Power2",
+      "type": "int32",
+      "mult": 0.001,
+      "units": "W"
+    },
+    {
+      "name": "Temp2",
+      "type": "int16",
+      "mult": 0.1,
+      "units": "degC"
+    },
+    {
+      "name": "Voltage3A",
+      "type": "int16",
+      "mult": 0.01,
+      "units": "V"
+    },
+    {
+      "name": "Current3A",
+      "type": "int16",
+      "mult": 0.001,
+      "units": "A"
+    },
+    {
+      "name": "Voltage3B",
+      "type": "int16",
+      "mult": 0.01,
+      "units": "V"
+    },
+    {
+      "name": "Current3B",
+      "type": "int16",
+      "mult": 0.001,
+      "units": "A"
+    },
+    {
+      "name": "Voltage3C",
+      "type": "int16",
+      "mult": 0.01,
+      "units": "V"
+    },
+    {
+      "name": "Current3C",
+      "type": "int16",
+      "mult": 0.001,
+      "units": "A"
+    },
+    {
+      "name": "Power3",
+      "type": "int32",
+      "mult": 0.001,
+      "units": "W"
+    },
+    {
+      "name": "Temp3",
+      "type": "int16",
+      "mult": 0.1,
+      "units": "degC"
+    },
+    {
+      "name": "StatusFlags",
+      "type": "bitfield",
+      "bits": [
+        "MainsPresent",
+        "PhaseALive",
+        "PhaseBLive",
+        "PhaseCLive",
+        "OverVoltage",
+        "UnderVoltage",
+        "OverCurrent",
+        "GroundFault",
+        "Overheat",
+        "FanFault",
+        "CalibrationValid",
+        "SelfTestPassed",
+        "RelayClosed",
+        "Synchronized",
+        "DataLoggingActive",
+        "RemoteLockout"
+      ]
+    },
+    {
+      "name": "Frequency",
+      "type": "float",
+      "units": "Hz"
+    },
+    {
+      "name": "EnergyTotal",
+      "type": "uint64",
+      "mult": 0.001,
+      "units": "kWh"
+    },
+    {
+      "name": "SampleCounter",
+      "type": "uint32"
+    }
+  ]
+}

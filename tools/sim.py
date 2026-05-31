@@ -6,7 +6,11 @@ RFC §4:
 
 * answers ``DESCRIPTION`` with a descriptor (the example descriptor by default),
 * on ``TELEMETRY`` streams RFC-conformant packets at a configurable rate, packing
-  several packets per datagram,
+  several packets per telemetry message,
+* in v2.0, splits any message that overflows the single-datagram budget across
+  several datagrams (RFC §5.6) — a long descriptor reply, **or** a telemetry
+  message whose batch is larger than one datagram (``--packets-per-message``),
+* in v1.0, keeps every message to a single datagram (no multi-datagram support),
 * acks ``STOP``,
 * honours the single-client rule: a command from a new source supersedes the
   previous client and resets the sequence counter.
@@ -19,6 +23,10 @@ Usage::
     py -3.8 tools/sim.py                       # serve example descriptor on :2102
     py -3.8 tools/sim.py --rate 2000 --version 2.0
     py -3.8 tools/sim.py --descriptor path/to/descriptor.json
+    # multi-datagram demo: a long descriptor whose reply spans 3 datagrams (v2.0)
+    py -3.8 tools/sim.py --version 2.0 --descriptor spec/examples/telemetry_long_example.json
+    # multi-datagram telemetry: 200-packet messages that span several datagrams (v2.0)
+    py -3.8 tools/sim.py --version 2.0 --packets-per-message 200
 """
 
 from __future__ import annotations
@@ -90,20 +98,54 @@ def _sample(descriptor: Descriptor, n: int, t0: float):
 
 
 def serve(host: str, port: int, descriptor_json: str, rate: float,
-          version, drop: float, bad_crc: bool) -> None:
+          version, drop: float, bad_crc: bool,
+          packets_per_message=None) -> None:
     descriptor = Descriptor.from_json(descriptor_json)
     packet_size = descriptor.packet_size
-    max_packets = (MTU_BUDGET - HEADER_SIZE - TRAILER_SIZE) // packet_size
-    if max_packets < 1:
-        raise SystemExit("packet size {} B exceeds the MTU budget".format(packet_size))
+    # Packets that fit a single datagram (header + N·packet + trailer ≤ MTU).
+    dgram_packets = (MTU_BUDGET - HEADER_SIZE - TRAILER_SIZE) // packet_size
+
+    # Telemetry packets per message ("batch"). v1.0 MUST stay within one datagram
+    # (RFC §2); v2.0 telemetry MAY span datagrams (RFC §5.6), so a batch larger
+    # than one datagram is allowed and send() chops the message into pieces.
+    if packets_per_message is not None:
+        batch = packets_per_message
+        if version[0] < 2 and batch > dgram_packets:
+            raise SystemExit(
+                "--packets-per-message {} exceeds the {} that fit one datagram; "
+                "v1.0 telemetry must be single-datagram (use --version 2.0)"
+                .format(batch, dgram_packets))
+    elif version[0] < 2 and dgram_packets < 1:
+        raise SystemExit("packet size {} B exceeds the MTU budget; v1.0 has no "
+                         "multi-datagram support".format(packet_size))
+    else:
+        # Default to a single datagram's worth (at least one packet, so a v2.0
+        # packet larger than the MTU still streams, one packet per message).
+        batch = max(1, dgram_packets)
+
+    # The DESCRIPTION reply is itself a message: in v1.0 it MUST fit one datagram
+    # (no multi-datagram support), so a descriptor whose reply overflows can't be
+    # served — reject it now rather than emit an over-MTU datagram on connect
+    # (which fails with OSError on a real interface). In v2.0 send() splits it.
+    descriptor_bytes = descriptor_json.encode("utf-8")
+    desc_reply_bytes = HEADER_SIZE + len(descriptor_bytes) + TRAILER_SIZE
+    if version[0] < 2 and desc_reply_bytes > MTU_BUDGET:
+        raise SystemExit(
+            "descriptor reply is {} B > {} B MTU budget; v1.0 has no "
+            "multi-datagram support (RFC §5.6) — shorten the descriptor or use "
+            "--version 2.0".format(desc_reply_bytes, MTU_BUDGET))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
     sock.settimeout(0.05)
-    print("pulseUDP sim on {}:{}  packet={} B  up to {} packets/datagram  "
-          "rate={} Hz  v{}.{}".format(host, port, packet_size, max_packets,
-                                      rate, version[0], version[1]))
+    msg_bytes = HEADER_SIZE + batch * packet_size + TRAILER_SIZE
+    n_dgrams = (msg_bytes + MTU_BUDGET - 1) // MTU_BUDGET
+    print("pulseUDP sim on {}:{}  packet={} B  {} packets/message"
+          "{}  rate={} Hz  v{}.{}".format(
+              host, port, packet_size, batch,
+              " ({} datagrams/message)".format(n_dgrams) if n_dgrams > 1 else "",
+              rate, version[0], version[1]))
 
     client = None          # current (addr) we stream to
     streaming = False
@@ -112,30 +154,50 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
     t0 = time.time()
     next_emit = time.time()
     period = 1.0 / rate if rate > 0 else 0.0
-    # Emit in datagram-sized batches; cap batch so we don't busy-spin.
-    batch = max_packets
 
     def send(mtype, payload=b"", drop=False):
         nonlocal seq
+        assert client is not None        # only sent in response to a client command
         # v1.0: sequence sent as 0 (RFC §3.1). v2.0: per-message counter.
         seq_field = (seq & 0xFFFF) if version[0] >= 2 else 0
         hdr = Header(message_type=int(mtype), sequence=seq_field,
                      payload_length=len(payload), version=(version[0], version[1]))
         reserved = b"\x00\x00"
-        framed = hdr.pack() + payload + reserved
+        body = hdr.pack() + payload + reserved   # whole message except the CRC
         if version[0] >= 2:
             # v2.0: real CRC-16/CCITT-FALSE over Magic..end of Reserved (RFC §3.2).
-            crc_val = crc16_ccitt(framed)
+            crc_val = crc16_ccitt(body)
             if bad_crc:
                 crc_val ^= 0xFFFF   # corrupt it to exercise the client's reject path
-            crc = struct.pack("<H", crc_val)
+            message = body + struct.pack("<H", crc_val)
         else:
             # v1.0: CRC unused, sent as 0 and ignored by the receiver (RFC §3.1).
-            crc = b"\x00\x00"
+            message = body + b"\x00\x00"
         # A dropped datagram still consumes its sequence number (as a real lost
         # packet would), so the receiver sees a gap; we just skip transmission.
         if not drop:
-            sock.sendto(framed + crc, client)
+            try:
+                if version[0] >= 2 and len(message) > MTU_BUDGET:
+                    # Multi-datagram (RFC §5.6): chop the contiguous message into
+                    # datagram-sized pieces. The first carries the header, the last
+                    # the trailer, and the middle ones are raw continuation bytes.
+                    pieces = [message[i:i + MTU_BUDGET]
+                              for i in range(0, len(message), MTU_BUDGET)]
+                    for piece in pieces:
+                        sock.sendto(piece, client)
+                    # One-shot replies (e.g. a long DESCRIPTION) log each split; the
+                    # telemetry stream would spam this every message, and the startup
+                    # line already reports its datagrams/message, so stay quiet there.
+                    if int(mtype) != MessageType.TELEMETRY:
+                        print("  {} sent as {} datagrams ({} B total)".format(
+                            MessageType(int(mtype)).name, len(pieces), len(message)))
+                else:
+                    sock.sendto(message, client)
+            except OSError as exc:
+                # A real interface rejects an over-MTU datagram (EMSGSIZE) or fails
+                # transiently; log and keep serving instead of crashing the server.
+                print("  WARNING: failed to send {} ({} B): {}".format(
+                    MessageType(int(mtype)).name, len(message), exc))
         if version[0] >= 2:
             seq = (seq + 1) & 0xFFFF
 
@@ -153,7 +215,7 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
                 print("client -> {}".format(addr))
             mtype = header.message_type
             if mtype == MessageType.DESCRIPTION:
-                send(MessageType.DESCRIPTION, descriptor_json.encode("utf-8"))
+                send(MessageType.DESCRIPTION, descriptor_bytes)
             elif mtype == MessageType.TELEMETRY:
                 streaming = True
                 next_emit = time.time()
@@ -187,6 +249,11 @@ def main(argv=None) -> int:
                    help="protocol version: 1.0 (seq=0, CRC=0) or 2.0 (active seq, "
                         "real CRC-16/CCITT-FALSE)")
     p.add_argument("--descriptor", help="path to a descriptor JSON (default: example)")
+    p.add_argument("--packets-per-message", type=int, default=None,
+                   help="telemetry packets per message (default: one datagram's "
+                        "worth). In v2.0 a value larger than one datagram makes "
+                        "the message span several datagrams (RFC §5.6); v1.0 "
+                        "rejects an over-MTU value.")
     p.add_argument("--drop", type=float, default=0.0,
                    help="fraction of datagrams to drop (v2.0 loss test), 0..1")
     p.add_argument("--bad-crc", action="store_true",
@@ -198,7 +265,8 @@ def main(argv=None) -> int:
                        if args.descriptor else _example_descriptor())
     try:
         serve(args.host, args.port, descriptor_json, args.rate,
-              (major, minor), args.drop, args.bad_crc)
+              (major, minor), args.drop, args.bad_crc,
+              packets_per_message=args.packets_per_message)
     except KeyboardInterrupt:
         print("\nstopped")
     return 0

@@ -29,9 +29,11 @@ A protocol is strictly request/response: the server only sends message(s) as a r
 - **Port:** `2102` (server listens here; client sends commands here).
 - **Byte order:** little-endian for all multi-byte fields.
 - **MTU budget:** one datagram payload is kept within a single Ethernet frame — **1472 bytes**
-  of UDP payload (1500 MTU − 20 IP − 8 UDP). A telemetry message MUST fit in one datagram for
-  efficiency. From protocol **v2.0** onward, other message types MAY span multiple datagrams
-  (see §5.7); in **v1.0** every message MUST fit in a single datagram.
+  of UDP payload (1500 MTU − 20 IP − 8 UDP). In **v1.0** every message MUST fit in a single
+  datagram. From protocol **v2.0** onward **any** message MAY be split across multiple datagrams 
+  and reassembled by the receiver (see §5.6). Keeping a message to a single datagram is still preferred 
+  for efficiency where it fits; a sender splits only when a batch (e.g. a large telemetry message or 
+  a long descriptor reply) genuinely overflows.
 
 **Single client.** The server serves exactly one client at a time. It learns the client's
 IP address and port from the source of any valid command it receives, and streams telemetry
@@ -44,7 +46,7 @@ for the new client. There is no multi-client support; the most recent client win
 
 A **message** is the logical unit defined here: a fixed header, an optional payload, and a CRC
 trailer, all contiguous with no padding. In **v1.0** a message occupies exactly one UDP
-datagram. In **v2.0** a large message MAY be split across several datagrams on the wire (§5.7);
+datagram. In **v2.0** a large message MAY be split across several datagrams on the wire (§5.6);
 the layout below always describes the **reassembled** message.
 
 ```
@@ -66,13 +68,13 @@ the layout below always describes the **reassembled** message.
 
 | Field | Type | Meaning |
 |---|---|---|
-| **Magic** | 2 bytes | The byte sequence `0x50 0x55` (ASCII "PU"), in this order on the wire — defined as a fixed byte sequence, not an endian-dependent integer. A datagram that does not begin with these bytes MUST be ignored, **except** continuation datagrams of a multi-datagram message in progress (§5.7), which carry raw payload and have no header. Lets a receiver find message boundaries / reject noise. |
+| **Magic** | 2 bytes | The byte sequence `0x50 0x55` (ASCII "PU"), in this order on the wire — defined as a fixed byte sequence, not an endian-dependent integer. A datagram that does not begin with these bytes MUST be ignored, **except** continuation datagrams of a multi-datagram message in progress (§5.6), which carry raw payload and have no header. Lets a receiver find message boundaries / reject noise. |
 | **Version major** | `uint8` | Incompatible protocol revision. This document covers major `1` and `2`. |
 | **Version minor** | `uint8` | Compatible additions within a major. Combined value is written `major.minor` (e.g. `1.0`, `2.0`). Two different versions are **not** required to be wire-compatible. |
 | **Type & sequence** | `uint32` | One 32-bit word carrying two sub-fields: **message type** in the high 16 bits, **sequence number** in the low 16 bits — `word = (message_type << 16) \| sequence_number`. |
 | ↳ **Message type** | `uint16` | What the message is / what it commands. See §4. |
-| ↳ **Sequence number** | `uint16` | Per-sender monotonic counter (wraps at 65536), one value **per message**, for stream-level loss detection. For a multi-datagram message (§5.7) it appears once, in the header (first datagram). **v1.0:** sender sets `0`, receiver ignores. **v2.0:** active. |
-| **Payload length** | `uint32` | Total number of payload bytes in the message — for a multi-datagram message (§5.7), the sum across all datagrams. MUST be 32-bit word aligned. May be `0`. |
+| ↳ **Sequence number** | `uint16` | Per-sender monotonic counter (wraps at 65536), one value **per message**, for stream-level loss detection. For a multi-datagram message (§5.6) it appears once, in the header (first datagram). **v1.0:** sender sets `0`, receiver ignores. **v2.0:** active. |
+| **Payload length** | `uint32` | Total number of payload bytes in the message — for a multi-datagram message (§5.6), the sum across all datagrams. MUST be 32-bit word aligned. May be `0`. |
 | **Payload** | bytes | Type-dependent; see §4 and §5. |
 | **Reserved** | `uint16` | Present in every version. Sender sets `0`, reserved for future use. |
 | **CRC-16** | `uint16` | Present in every version. CRC-16 (algorithm in §3.2) over the bytes from Magic through the end of Reserved (i.e. the whole message except the CRC field itself); for a multi-datagram message this covers the **entire reassembled** message. Stored as a `uint16` **little-endian** (low byte at offset 14+N), like every other multi-byte field. **v1.0:** sender sets `0`, receiver ignores. **v2.0:** filled and validated. |
@@ -100,7 +102,7 @@ reflected, init-`0x0000` Kermit variant, which would yield a different value.)
 **Coverage:** the CRC is computed over every byte of the message except the two
 CRC bytes themselves — Magic, both Version bytes, the Type & sequence word, Payload
 length, the whole Payload, and Reserved, in wire order. For a multi-datagram message
-(§5.7) it is computed over the **entire reassembled** message, not per datagram.
+(§5.6) it is computed over the **entire reassembled** message, not per datagram.
 
 The 16-bit result is then written to the trailer little-endian (§3.1), so on the wire
 a receiver may equivalently verify the message by running the same CRC over the bytes
@@ -134,7 +136,7 @@ transaction).
 | Constant | Value (uint16) | Transaction | client → server | server → client |
 |---|---|---|---|---|
 | `DESCRIPTION` | `0x0001` | Get descriptor | request, empty payload | JSON descriptor (see §5), UTF-8, no NUL terminator |
-| `TELEMETRY` | `0x0002` | Telemetry stream | request to start, empty payload | streamed telemetry packets, one or more per datagram (see §5.3), until stopped |
+| `TELEMETRY` | `0x0002` | Telemetry stream | request to start, empty payload | streamed telemetry messages, with one or more packets (see §5.3); in **v2.0** a message MAY span several datagrams (§5.6), until stopped |
 | `STOP` | `0x0003` | Stop stream | request, empty payload | acknowledgement, empty payload (sent once streaming has ceased) |
 
 ### 4.1 Session flow
@@ -215,7 +217,8 @@ zero. The bit gaps are supported by using name `Reserved` in the descriptor.
 ### 5.3 Packet stream
 
 A `TELEMETRY` payload is an integer number of telemetry packets laid end to end with a possible gap in the end. The trailing gap may happen when an integer number of telemetry packets can't fit in the payload. Each packet is the field values in descriptor order, each value sized per §5.2. The number of
-packets in a datagram = round_down( Payload length ÷ packet size ).
+packets in a message = round_down( Payload length ÷ packet size ), where `Payload length` is the
+message total (§3).
 
 ### 5.4 Example packet
 
@@ -232,7 +235,10 @@ packets in a datagram = round_down( Payload length ÷ packet size ).
 | | **Packet total** | | 8 | 32 |
 
 **Datagram packing example:** header 12 B + 45 packets × 32 B + 4 B trailer = 1456 B ≤ 1472 B.
-So up to **45 telemetry packets per UDP datagram**.
+So up to **45 telemetry packets fit one UDP datagram**. In **v1.0** that is the hard per-message
+limit. In **v2.0** a telemetry message MAY carry more (e.g. 100 packets) and be split across
+several datagrams per §5.6; the reassembled message still has a single header, trailer, sequence
+number, and whole-message CRC.
 
 ### 5.5 Units and multipliers
 
@@ -274,17 +280,22 @@ server sends the pieces back to back.
 
 **In-order, all-or-nothing.** This scheme assumes the datagrams of one transfer arrive **in
 order**, which the single-client session (§2) and strict request/response (§4) make the normal
-case: the server emits nothing else between the first datagram and the trailer, and sends a
-new message only in response to a new request. The receiver cannot reorder headerless pieces, so
+case: the server emits the datagrams of a message back to back with nothing interleaved between
+its first datagram and its trailer. For a telemetry stream this applies per message — the server
+finishes one multi-datagram telemetry message (header → continuation → trailer) before beginning
+the next, each message carrying its own header, sequence number, and whole-message CRC. The
+receiver cannot reorder headerless pieces, so
 any reordering, loss, or duplication makes the concatenation wrong and the CRC (or the final
 length) **rejects the entire message** — there is no partial recovery or per-datagram
 retransmit. This can happen in the big networks with various ways of packet transfer, where packets order may change.
 
 **Loss, timeout, retry.** If a datagram is lost the buffer never reaches the expected length; the
-client MUST apply a **reassembly timeout** of `300 ms`, discard the partial buffer, and re-request (the
-transaction is idempotent, §4). On a CRC reject the client likewise discards and re-requests.
-The single `sequence_number` identifies the *message* (for stream-level loss detection), not the
-pieces within it.
+client MUST apply a **reassembly timeout** of `300 ms` and discard the partial buffer. For a
+one-shot transaction (`DESCRIPTION`, `STOP`) it then re-requests (the transaction is idempotent,
+§4); on a CRC reject it likewise discards and re-requests. For the continuous telemetry stream
+there is nothing to re-request — a lost or CRC-rejected message is simply dropped, surfacing as a
+**sequence gap** at the next good message, and streaming continues. The single `sequence_number`
+identifies the *message* (for stream-level loss detection), not the pieces within it.
 
 ## 6. Version matrix
 

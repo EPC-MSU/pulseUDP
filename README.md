@@ -57,8 +57,24 @@ python -m PyInstaller packaging/pulseudp.spec --noconfirm   # standalone app in 
 The PyInstaller build is **one-folder** (faster startup, fewer antivirus false positives than
 one-file) and bundles the descriptor schema, Qt platform plugins, and the third-party license
 texts. Ship the whole `dist/pulseUDP/` folder, e.g. zipped. Pushing a `vX.Y.Z` tag runs
-`.github/workflows/release.yml`, which builds the wheel/sdist and the Windows zip and attaches
-them to a GitHub Release.
+`.github/workflows/release.yml`, which builds the wheel/sdist plus standalone Windows (`.zip`)
+and Linux (`.tar.gz`) bundles and attaches them all to a GitHub Release.
+
+## Releasing
+
+Version bumps are automated with [bump2version](https://github.com/c4urself/bump2version)
+(config in `.bumpversion.cfg`). It rewrites the version in `pyproject.toml` and
+`src/pulseudp/__init__.py` in lockstep, commits, and creates the matching `vX.Y.Z` tag
+(install it with `pip install -e .[package]`):
+
+```sh
+bump2version patch      # 1.0.0 -> 1.0.1   (also: minor, major)
+git push --follow-tags  # push the commit AND the tag
+```
+
+Pushing the tag triggers the release workflow above. (bump2version commits and tags but does
+not push — that stays a deliberate, separate step.) The protocol version in
+`spec/RFC-pulseUDP.md` is independent of the package version and is **not** touched by this.
 
 ## License
 

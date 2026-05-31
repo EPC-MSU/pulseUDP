@@ -1,7 +1,8 @@
 name: Release
 
 # Build distributable artifacts on a version tag and attach them to a GitHub
-# Release: a pure-Python wheel + sdist, and a standalone Windows one-folder zip.
+# Release: a pure-Python wheel + sdist, and standalone one-folder builds for
+# Windows (zip) and Linux (tar.gz).
 on:
   push:
     tags:
@@ -19,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"     # pure py3-none-any wheel; version-independent
+          python-version: "3.11"
       - run: python -m pip install --upgrade build
       - run: python -m build         # -> dist/*.whl, dist/*.tar.gz
       - uses: actions/upload-artifact@v4
@@ -27,27 +28,38 @@ jobs:
           name: dist-python
           path: dist/*
 
-  windows-exe:
-    name: Standalone Windows exe
-    runs-on: windows-latest
+  standalone:
+    # One PyInstaller one-folder build per OS. The spec is platform-agnostic;
+    # only the archive command differs. ubuntu-22.04 (not latest) keeps the
+    # glibc baseline old enough for broad Linux compatibility.
+    name: Standalone (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            archive: pulseUDP-windows-x64.zip
+            archive_cmd: Compress-Archive -Path dist/pulseUDP -DestinationPath pulseUDP-windows-x64.zip
+          - os: ubuntu-22.04
+            archive: pulseUDP-linux-x64.tar.gz
+            archive_cmd: tar -czf pulseUDP-linux-x64.tar.gz -C dist pulseUDP
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.8"      # match the tested runtime floor
-      - run: python -m pip install -e .[gui] pyinstaller
+          python-version: "3.11"
+      - run: python -m pip install -e .[gui,package]
       - run: python -m PyInstaller packaging/pulseudp.spec --noconfirm
-      - name: Zip the one-folder build
-        shell: pwsh
-        run: Compress-Archive -Path dist/pulseUDP -DestinationPath pulseUDP-windows-x64.zip
+      - name: Archive the one-folder build      # default shell per OS: pwsh / bash
+        run: ${{ matrix.archive_cmd }}
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-windows
-          path: pulseUDP-windows-x64.zip
+          name: dist-standalone-${{ matrix.os }}
+          path: ${{ matrix.archive }}
 
   release:
     name: Publish release
-    needs: [wheel, windows-exe]
+    needs: [wheel, standalone]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -59,5 +71,5 @@ jobs:
         with:
           files: |
             artifacts/dist-python/*
-            artifacts/dist-windows/*
+            artifacts/dist-standalone-*/*
           generate_release_notes: true

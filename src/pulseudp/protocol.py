@@ -301,6 +301,6 @@ class Descriptor:
         return [f for i, f in enumerate(self.fields) if i != ts]
 
 
-# TODO(v2.0): CRC-16 validation over the whole (possibly reassembled) message.
-# Algorithm is CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection,
-# xorout 0x0000; check value 0x29B1) — see RFC §3.2.
+# v2.0 trailer CRC (CRC-16/CCITT-FALSE, see crc16_ccitt above) and length-delimited
+# multi-datagram reassembly (RFC §5.6) are validated/performed in client.py, where
+# the whole (possibly reassembled) message is available.

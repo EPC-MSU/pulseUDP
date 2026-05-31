@@ -7,6 +7,7 @@ logic directly via ``_handle_datagram`` / ``_send`` without touching the network
 
 import json
 import struct
+import time
 
 import pytest
 
@@ -121,6 +122,82 @@ def test_send_v01_zeroes_sequence_and_crc():
         assert hdr.version == (1, 0)
         assert hdr.sequence == 0
         assert int.from_bytes(data[-2:], "little") == 0   # CRC sent as zero
+
+
+# -- multi-datagram reassembly (RFC §5.6, v2.0) -------------------------------
+
+def _split(message, pieces):
+    """Chop a contiguous message into ``pieces`` datagram-sized parts (RFC §5.6)."""
+    size = (len(message) + pieces - 1) // pieces
+    return [message[i:i + size] for i in range(0, len(message), size)]
+
+
+# A payload too big for one datagram; the first piece carries the header, the
+# rest are headerless continuation bytes.
+_BIG_PAYLOAD = b"D" * 3000
+
+
+def test_multidatagram_description_reassembles():
+    c = UdpClient("127.0.0.1", version=(2, 0))
+    msg = _datagram(MessageType.DESCRIPTION, 0, (2, 0), payload=_BIG_PAYLOAD)
+    pieces = _split(msg, 3)
+    assert len(pieces) == 3 and len(pieces[0]) < len(msg)   # genuinely multi
+    for p in pieces:
+        c._handle_datagram(p)
+    reply_version, payload = c._desc_q.get_nowait()
+    assert reply_version == (2, 0)
+    assert payload == _BIG_PAYLOAD                          # whole payload recovered
+
+
+def test_multidatagram_bad_crc_rejected():
+    events = []
+    c = UdpClient("127.0.0.1", version=(2, 0), on_log=lambda e: events.append(e))
+    msg = _datagram(MessageType.DESCRIPTION, 0, (2, 0),
+                    payload=_BIG_PAYLOAD, good_crc=False)
+    for p in _split(msg, 3):
+        c._handle_datagram(p)
+    assert c._desc_q.empty()                                # whole message dropped
+    assert [e.category for e in events] == ["crc"]          # checked after reassembly
+
+
+def test_multidatagram_overrun_rejected():
+    events = []
+    c = UdpClient("127.0.0.1", version=(2, 0), on_log=lambda e: events.append(e))
+    pieces = _split(_datagram(MessageType.DESCRIPTION, 0, (2, 0),
+                              payload=_BIG_PAYLOAD), 3)
+    c._handle_datagram(pieces[0])
+    c._handle_datagram(pieces[1])
+    c._handle_datagram(pieces[2] + b"EXTRA")                # one byte run too long
+    assert c._reasm is None
+    assert c._desc_q.empty()
+    assert [e.category for e in events] == ["reasm"]
+
+
+def test_multidatagram_timeout_discards_then_recovers():
+    events = []
+    c = UdpClient("127.0.0.1", version=(2, 0), on_log=lambda e: events.append(e))
+    pieces = _split(_datagram(MessageType.DESCRIPTION, 0, (2, 0),
+                              payload=_BIG_PAYLOAD), 3)
+    c._handle_datagram(pieces[0])
+    assert c._reasm is not None                             # reassembly opened
+    c._reasm.deadline = time.monotonic() - 0.001            # force past the deadline
+    c._expire_reassembly()
+    assert c._reasm is None
+    assert [e.category for e in events] == ["reasm"]
+    assert "timeout" in events[0].message
+    # A complete single-datagram reply now lands normally (transaction re-requested).
+    c._handle_datagram(_datagram(MessageType.DESCRIPTION, 1, (2, 0), payload=_DESC_JSON))
+    _version, payload = c._desc_q.get_nowait()
+    assert payload == _DESC_JSON
+
+
+def test_v01_never_reassembles():
+    # v1.0 has no multi-datagram support: a short datagram is just a short
+    # datagram, never the start of a reassembly.
+    c = UdpClient("127.0.0.1", version=(1, 0))
+    msg = _datagram(MessageType.DESCRIPTION, 0, (1, 0), payload=_BIG_PAYLOAD)
+    c._handle_datagram(_split(msg, 3)[0])                   # only the first piece
+    assert c._reasm is None                                 # no reassembly state
 
 
 # -- version negotiation (RFC §6.1) -------------------------------------------

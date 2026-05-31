@@ -15,6 +15,7 @@ import queue
 import socket
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -30,14 +31,15 @@ DEFAULT_PORT = 2102
 SUPPORTED_VERSIONS = ((2, 0), (1, 0))
 PROBE_VERSION = SUPPORTED_VERSIONS[0]
 _RECV_BUFSIZE = 65535
-_SOCK_TIMEOUT = 0.2  # s, receiver loop wakeup so it can observe close()
+_SOCK_TIMEOUT = 0.2    # s, receiver loop wakeup so it can observe close()
+_REASM_TIMEOUT = 0.3   # s, multi-datagram reassembly deadline (RFC §5.6)
 
 
 @dataclass
 class LogEvent:
     """A protocol-level event for the log panel. The consumer adds the wall clock."""
 
-    category: str    # bad_magic | bad_version | short | decode | seq_gap | crc | info | error
+    category: str    # bad_magic | bad_version | short | decode | seq_gap | crc | reasm | info | error
     message: str
     level: str = "warning"   # info | warning | error
 
@@ -46,6 +48,21 @@ class LogEvent:
 TelemetryCb = Callable[[np.ndarray], None]   # receives a decoded packet array
 LogCb = Callable[[LogEvent], None]
 StateCb = Callable[[str, str], None]          # (state, detail)
+
+
+@dataclass
+class _Reassembly:
+    """In-progress multi-datagram message (v2.0, RFC §5.6).
+
+    Only the first datagram carries the header; the rest are raw continuation
+    bytes appended to ``buf`` until it reaches ``expected`` total bytes
+    (``HEADER_SIZE + payload_length + TRAILER_SIZE``).
+    """
+
+    header: Header
+    expected: int
+    deadline: float       # time.monotonic() past which the partial buffer is dropped
+    buf: bytearray
 
 
 class UdpClient:
@@ -102,6 +119,7 @@ class UdpClient:
         self._streaming = False
         self._last_seq: Optional[int] = None   # last RX sequence (loss detection)
         self._tx_seq = 0                        # next TX sequence (v2.0 outbound)
+        self._reasm: Optional[_Reassembly] = None  # multi-datagram in progress
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -112,6 +130,7 @@ class UdpClient:
         self._closing.clear()
         self._tx_seq = 0
         self._last_seq = None
+        self._reasm = None
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(_SOCK_TIMEOUT)
         self._sock = sock
@@ -221,12 +240,23 @@ class UdpClient:
             try:
                 data, _addr = sock.recvfrom(_RECV_BUFSIZE)
             except socket.timeout:
+                # Idle wakeup: also a chance to time out a stalled reassembly even
+                # when no further datagrams arrive (RFC §5.6).
+                self._expire_reassembly()
                 continue
             except OSError:
                 break
             self._handle_datagram(data)
 
     def _handle_datagram(self, data: bytes) -> None:
+        # A multi-datagram message in progress (v2.0, RFC §5.6): every datagram
+        # after the first is raw continuation bytes — no header, no magic — so it
+        # must not be parsed as a header. Append it and try to complete.
+        self._expire_reassembly()
+        if self._reasm is not None:
+            self._feed_reassembly(data)
+            return
+
         try:
             header = Header.unpack(data)
         except ValueError as exc:
@@ -242,16 +272,64 @@ class UdpClient:
                       "unsupported version {}.{}".format(*header.version))
             return
 
+        # Length-delimited reassembly (RFC §5.6, v2.0 only): a first datagram that
+        # carries fewer bytes than its header declares (12 + payload_length + 4)
+        # opens a multi-datagram message; the remaining pieces arrive headerless.
+        expected = HEADER_SIZE + header.payload_length + TRAILER_SIZE
+        if header.version[0] >= 2 and len(data) < expected:
+            self._reasm = _Reassembly(
+                header=header, expected=expected,
+                deadline=time.monotonic() + _REASM_TIMEOUT,
+                buf=bytearray(data))
+            return
+
+        self._process_message(header, data)
+
+    def _feed_reassembly(self, data: bytes) -> None:
+        """Append a continuation datagram; process the message once it's complete."""
+        r = self._reasm
+        assert r is not None
+        r.buf += data
+        if len(r.buf) < r.expected:
+            return                          # still waiting for more pieces
+        if len(r.buf) > r.expected:
+            # Over-run: a lost/reordered/duplicated piece corrupted the stream.
+            # All-or-nothing (RFC §5.6) — drop and let the caller re-request.
+            self._log("reasm", "warning",
+                      "reassembled {} B exceeds expected {} B; message dropped".format(
+                          len(r.buf), r.expected))
+            self._reasm = None
+            return
+        header, message = r.header, bytes(r.buf)
+        self._reasm = None
+        self._process_message(header, message)
+
+    def _expire_reassembly(self) -> None:
+        """Discard a partial multi-datagram buffer past its deadline (RFC §5.6)."""
+        r = self._reasm
+        if r is not None and time.monotonic() > r.deadline:
+            self._log("reasm", "warning",
+                      "reassembly timeout: discarded {}/{} B; message will be "
+                      "re-requested".format(len(r.buf), r.expected))
+            self._reasm = None
+
+    def _process_message(self, header: Header, data: bytes) -> None:
+        """Handle one complete message: ``data`` is header ‖ payload ‖ trailer.
+
+        Called for single-datagram messages and for the reassembled bytes of a
+        multi-datagram one alike, so the CRC covers the whole message either way.
+        """
         # CRC and sequence are v2.0 concerns: in v1.0 both fields are sent as 0
-        # and ignored, so neither is checked. Each datagram is judged by its own
+        # and ignored, so neither is checked. Each message is judged by its own
         # version field, so the client handles a mixed/either-version server.
         if header.version[0] >= 2:
             # Validate the trailer CRC-16/CCITT-FALSE (RFC §3.2) before trusting
-            # anything else in the datagram; a bad CRC means the header (and its
-            # sequence number) is unreliable, so drop without updating seq state.
+            # anything else; a bad CRC means the header (and its sequence number)
+            # is unreliable, so drop without updating seq state. For a reassembled
+            # message this covers the entire reassembled message (RFC §5.6).
             if not self._crc_ok(data):
                 self._log("crc", "warning",
-                          "CRC mismatch (type 0x{:04x}); datagram dropped".format(
+                          "CRC mismatch (type 0x{:04x}); message dropped".format(
                               header.message_type))
                 return
             # Sequence-loss detection runs on the telemetry stream only.
