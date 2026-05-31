@@ -32,8 +32,7 @@ A protocol is strictly request/response: the server only sends message(s) as a r
   of UDP payload (1500 MTU − 20 IP − 8 UDP). In **v1.0** every message MUST fit in a single
   datagram. From protocol **v2.0** onward **any** message MAY be split across multiple datagrams 
   and reassembled by the receiver (see §5.6). Keeping a message to a single datagram is still preferred 
-  for efficiency where it fits; a sender splits only when a batch (e.g. a large telemetry message or 
-  a long descriptor reply) genuinely overflows.
+  for efficiency and stability where it fits; a sender splits only when a batch (e.g. a large telemetry message or a long descriptor reply) genuinely overflows.
 
 **Single client.** The server serves exactly one client at a time. It learns the client's
 IP address and port from the source of any valid command it receives, and streams telemetry
@@ -138,13 +137,17 @@ transaction).
 | `DESCRIPTION` | `0x0001` | Get descriptor | request, empty payload | JSON descriptor (see §5), UTF-8, no NUL terminator |
 | `TELEMETRY` | `0x0002` | Telemetry stream | request to start, empty payload | streamed telemetry messages, with one or more packets (see §5.3); in **v2.0** a message MAY span several datagrams (§5.6), until stopped |
 | `STOP` | `0x0003` | Stop stream | request, empty payload | acknowledgement, empty payload (sent once streaming has ceased) |
+| `GET_CHANNELS` | `0x0004` | Get currently enabled telemetry channels (v2.0 only) | request, empty payload | acknowledgement, payload with one or more 32-bit words where each bit in order from the least significant bit in the last word signals whether the corresponding channel is enabled |
+| `SET_CHANNELS` | `0x0005` | Set currently enabled telemetry channels (v2.0 only) | request, the same payload as in the GET_CHANNELS command, but the client states which channels should be enabled | acknowledgement, the same payload as in GET_CHANNELS; may differ from the request when the server refuses the request |
 
 ### 4.1 Session flow
 
 ```
 client                                      Server
- |  DESCRIPTION (request)  ─────────────────►|   (records client source IP:port)
+ |  DESCRIPTION (request)  ─────────────────►|   (records client source IP:port, determines the protocol)
  |◄────────────  DESCRIPTION (JSON reply)    |   ← response (required)
+ |  GET_CHANNELS (v2.0 only)  ──────────────►|   ← get enabled channels list
+ |◄────────────  GET_CHANNELS (v2.0 only)    |   ← response (required)
  |  TELEMETRY (start request)  ─────────────►|
  |◄──────────────  TELEMETRY (packets)       |  ┐  first packet = ack (required)
  |◄──────────────  TELEMETRY (packets)       |  │  continuous stream
@@ -159,6 +162,8 @@ request and its reply share a message type, the receiver distinguishes them by d
 payload — no heuristics.
 
 The protocol design allows client version descovery. Since version 1.0 server ignores the version number for the incoming packets, the client can send `v2.0` request and learn the server protocol version by its reply (§6.1).
+
+There is a difference in the session handshake prerequisite for v1.0 and v2.0 protocol versions. In v1.0 protocol all descriptor telemetry fields are enabled and the telemetry list is immutable. So only the descriptor is required to parse telemetry. In v2.0 protocol the descriptor provides only the possible telemetry channels and two more commands are used to get the list of enabled channels and set the list. The structure of the `GET_CHANNELS`/`SET_CHANNELS` payload is pure binary to facilitate microcontroller implementation that would not require JSON parsing. The lesser bit in the last word corresponds to the first telemetry channel in the descriptor. If there are more than 32 channels, the second word appears in the payload and its lesser bit corresponds to the 33 channel in the descriptor list. The server may refuse to accept the new channels list. In the payload of `SET_CHANNELS` response the server states the best option it can offer for the client request. It may disable all channels, revert to the default list, keep the old list, truncate the required list up to its capabilities or do something else.
 
 ## 5. Payload: telemetry packets and the JSON descriptor
 
@@ -176,9 +181,7 @@ The descriptor supports the list of the telemetry values, describing their
 
 The special flag type is also supported so binary flags can be sent along with numbers.
 
-There is a difference in interpretation of JSON descriptor between the protocol versions. In version `0.1` the descriptor list exactly the fields that it will 
-
-We detect the telemetry packet size from the number of the data points and their size. The descriptor along with the payload size is sufficient to decode the telemetry payload.
+There is a difference in interpretation of JSON descriptor between the protocol versions. In version `1.0` the descriptor list exactly the fields of the telemetry package. In version `v2.0` the list consists of possible telemetry channels that the server can provide. Separate negotiation of the enabled channels is required between client and server to get the actual telemetry package list and parse the payload. The number of the telemetry packages inside one message is derived from the number of the data points and their size.
 
 The descriptor also carries a `version` (required) — its own revision in semantic-versioning form, e.g. `1.0.0`. This descriptor version is independent of the protocol version in the message header (§3); it lets a client recognise when the telemetry layout has changed. An optional `id` object may carry server identification (such as device name, serial number, and firmware version) for display; its inner structure is not yet fixed.
 
@@ -211,7 +214,7 @@ from its in-memory buffer with no packing.
 | `double` | IEEE-754 double | 2 | 8 |
 
 **Bitfields.** A `bitfield` is always a `uint32`. Bits are assigned in the order listed in
-the descriptor, starting from the least-significant bit. With fewer than 32 names, the high bits are
+the descriptor, starting from the least-significant bit. Having fewer than 32 names, the high bits are
 zero. The bit gaps are supported by using name `Reserved` in the descriptor.
 
 ### 5.3 Packet stream
@@ -302,13 +305,12 @@ identifies the *message* (for stream-level loss detection), not the pieces withi
 | Capability | v1.0 (lite) | v2.0 (full) |
 |---|---|---|
 | Magic / version / type / payload-length header | server sets its version but doesn't check client's version | ✔ |
-| Request/response handshake (`DESCRIPTION` / `TELEMETRY` / `STOP`) | ✔ | ✔ |
-| JSON descriptor + binary packet stream | ✔ | ✔ |
+| Simple handshake (just `DESCRIPTION` request/response) | ✔ | x |
 | Single-client session (new client supersedes the old) | ✔ | ✔ |
 | **Sequence number** | field present, sent as `0`, ignored | active, monotonic, used for loss detection |
 | **CRC trailer** (Reserved + CRC-16) | present, sent as `0` and ignored | present, filled and validated |
 | **Multi-datagram messages** (one header/trailer, payload split over datagrams) | not allowed — every message fits one datagram | supported; in-order, all-or-nothing, whole-message CRC |
-| Adaptive / runtime descriptor (runtime substitution of reserved names) | not implemented | candidate (TBD) |
+| User selectable telemetry channels | x | ✔ |
 
 `major.minor` is carried as two bytes (`Version major`, `Version minor`). A client MUST
 read the version before parsing payload semantics, since major versions are not required to be
@@ -347,11 +349,3 @@ elicits a version-revealing reply. The client never has to guess or alternate ve
    For large multi-datagram messages this has a non-negligible chance of accepting a corrupted
    stream. A future major version may widen the trailer to a CRC-32; this would be a
    wire-incompatible change and is therefore deferred to a new `Version major`.
-
-## 8. Future plans
-
-### Selectable telemetry fields
-
-Currently the telemetry structure is described by the JSON descriptor and cannot be changed from the client. But there is a way to enhance the pulseUDP protocol by changing the semantics of the telemetry fields from mandatory to optional. The descriptor will list all available fields for selection. Then two more message types will request and set the enable/disable bitfields corresponding to the sequence of the fields in the descriptor. The telemetry packet length will become variable.
-
-There is a cheap way to implement customizable telemetry in the microcontroller. The buffer for telemetry (and payload size) may have a fixed size for efficiency. When payload size cannot be divided by telemetry packet size we will just leave some padding. When client will ask for the excessive telemetry packet size, the server will refuse in its response message. The copying itself will be done by the list of the substitutable addresses from the full list of supported fields.
