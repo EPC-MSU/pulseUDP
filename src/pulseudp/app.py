@@ -118,6 +118,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view_s = DEFAULT_VIEW_S
 
         self._plots: List[pg.PlotItem] = []
+        self._visible_plots: List[pg.PlotItem] = []   # currently laid-out subset
+        self._primary_plot: Optional[pg.PlotItem] = None  # X-axis anchor
+        self._group_fields: List[List[int]] = []      # channel indices per plot
         self._link_vb: Optional[pg.ViewBox] = None
         self._curves: Dict[str, pg.PlotDataItem] = {}
         self._bit_offset: Dict[str, int] = {}   # bit trace key -> stack row
@@ -370,6 +373,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._graphs.clear()
         self._tree.clear()
         self._plots = []
+        self._group_fields = []   # parallel to _plots: channel indices feeding each
         self._curves = {}
         self._bit_offset = {}
         self._channel_checks = {}
@@ -405,6 +409,14 @@ class MainWindow(QtWidgets.QMainWindow):
             vb.setAutoVisible(y=True)
             vb.enableAutoRange(x=False, y=True)
             self._plots.append(plot)
+            # Descriptor channels feeding this plot (for show/hide on selection):
+            # a bitfield plot is fed by its one field; a numeric plot by each of
+            # its traces' fields.
+            if group.kind == "bitfield":
+                gfis = [index_by_name.get(group.title)]
+            else:
+                gfis = [index_by_name.get(tr.key) for tr in group.traces]
+            self._group_fields.append([i for i in gfis if i is not None])
 
             if group.kind == "bitfield":
                 # Stack bits on integer rows; label the y axis with bit names.
@@ -441,6 +453,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                         index_by_name.get(tr.key))
 
         self._tree.expandToDepth(0)
+        # All groups visible initially; channel selection narrows this (v2.0).
+        self._visible_plots = list(self._plots)
+        self._primary_plot = self._plots[0] if self._plots else None
 
     def _add_field_row(self, name: str, type_str: str, color: Optional[str],
                        field_index: Optional[int]) -> QtWidgets.QTreeWidgetItem:
@@ -506,7 +521,42 @@ class MainWindow(QtWidgets.QMainWindow):
             self._suppress_check = False
         if self._ring is not None:
             self._ring.clear()              # packet layout changed; drop stale data
+        self._relayout_plots(enabled)       # hide plots of disabled channels
         self._set_checks_enabled(not self._running)
+
+    def _relayout_plots(self, enabled) -> None:
+        """Show only plots with an enabled channel; reflow them to fill the space.
+
+        Disabled channels (v2.0) carry no data, so their plots are pulled out of
+        the graphics layout and the rest pack upward. The full channel list stays
+        in the tree, so any channel can be re-enabled. The X-axis follows the
+        first visible plot.
+        """
+        if not self._plots:
+            return
+        n = len(enabled)
+
+        def visible(gi: int) -> bool:
+            fis = self._group_fields[gi]
+            return any(i < n and enabled[i] for i in fis) if fis else True
+
+        shown = [self._plots[gi] for gi in range(len(self._plots)) if visible(gi)]
+        # Remove every plot, then re-add the visible ones so rows pack with no gaps.
+        for plot in self._plots:
+            try:
+                self._graphs.removeItem(plot)
+            except Exception:  # noqa: BLE001 - already out of the layout
+                pass
+        self._visible_plots = []
+        self._primary_plot = None
+        for r, plot in enumerate(shown):
+            self._graphs.addItem(plot, row=r, col=0)
+            if self._primary_plot is None:
+                self._primary_plot = plot
+                plot.setXLink(None)              # primary anchors the X axis
+            else:
+                plot.setXLink(self._primary_plot)
+            self._visible_plots.append(plot)
 
     @staticmethod
     def _swatch(color: str) -> QtGui.QIcon:
@@ -528,9 +578,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 curve.setData(t, y * 0.8 + self._bit_offset[key])
             else:
                 curve.setData(t, y)
-        if self._running and self._plots:
+        if self._running and self._primary_plot is not None:
             latest = float(t[-1])
-            self._plots[0].getViewBox().setXRange(
+            self._primary_plot.getViewBox().setXRange(
                 latest - self._view_s, latest, padding=0)
 
     # -- wheel state machine --------------------------------------------------
@@ -540,9 +590,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # data outside the visible range is retained (up to the history size) and
         # reappears when zooming back out.
         self._view_s = min(MAX_WINDOW_S, max(MIN_WINDOW_S, self._view_s * factor))
-        if not self._running and self._plots and x is not None:
+        if not self._running and self._primary_plot is not None and x is not None:
             # Stopped: zoom around the pointer (X is linked across plots).
-            vb = self._plots[0].getViewBox()
+            vb = self._primary_plot.getViewBox()
             (x0, x1), _ = vb.viewRange()
             nx0 = x - (x - x0) * factor
             nx1 = x + (x1 - x) * factor
