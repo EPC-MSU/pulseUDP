@@ -7,6 +7,8 @@ RFC §4:
 * answers ``DESCRIPTION`` with a descriptor (the example descriptor by default),
 * on ``TELEMETRY`` streams RFC-conformant packets at a configurable rate, packing
   several packets per datagram,
+* in v2.0, splits any message that overflows the single-datagram budget across
+  several datagrams (RFC §5.6) — e.g. a long descriptor reply,
 * acks ``STOP``,
 * honours the single-client rule: a command from a new source supersedes the
   previous client and resets the sequence counter.
@@ -19,6 +21,8 @@ Usage::
     py -3.8 tools/sim.py                       # serve example descriptor on :2102
     py -3.8 tools/sim.py --rate 2000 --version 2.0
     py -3.8 tools/sim.py --descriptor path/to/descriptor.json
+    # multi-datagram demo: a long descriptor whose reply spans 3 datagrams (v2.0)
+    py -3.8 tools/sim.py --version 2.0 --descriptor spec/examples/telemetry_long_example.json
 """
 
 from __future__ import annotations
@@ -117,25 +121,42 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
 
     def send(mtype, payload=b"", drop=False):
         nonlocal seq
+        assert client is not None        # only sent in response to a client command
         # v1.0: sequence sent as 0 (RFC §3.1). v2.0: per-message counter.
         seq_field = (seq & 0xFFFF) if version[0] >= 2 else 0
         hdr = Header(message_type=int(mtype), sequence=seq_field,
                      payload_length=len(payload), version=(version[0], version[1]))
         reserved = b"\x00\x00"
-        framed = hdr.pack() + payload + reserved
+        body = hdr.pack() + payload + reserved   # whole message except the CRC
         if version[0] >= 2:
             # v2.0: real CRC-16/CCITT-FALSE over Magic..end of Reserved (RFC §3.2).
-            crc_val = crc16_ccitt(framed)
+            crc_val = crc16_ccitt(body)
             if bad_crc:
                 crc_val ^= 0xFFFF   # corrupt it to exercise the client's reject path
-            crc = struct.pack("<H", crc_val)
+            message = body + struct.pack("<H", crc_val)
         else:
             # v1.0: CRC unused, sent as 0 and ignored by the receiver (RFC §3.1).
-            crc = b"\x00\x00"
+            message = body + b"\x00\x00"
         # A dropped datagram still consumes its sequence number (as a real lost
         # packet would), so the receiver sees a gap; we just skip transmission.
         if not drop:
-            sock.sendto(framed + crc, client)
+            if version[0] >= 2 and len(message) > MTU_BUDGET:
+                # Multi-datagram (RFC §5.6): chop the contiguous message into
+                # datagram-sized pieces. The first carries the header, the last
+                # the trailer, and the middle ones are raw continuation bytes.
+                pieces = [message[i:i + MTU_BUDGET]
+                          for i in range(0, len(message), MTU_BUDGET)]
+                for piece in pieces:
+                    sock.sendto(piece, client)
+                print("  {} sent as {} datagrams ({} B total)".format(
+                    MessageType(int(mtype)).name, len(pieces), len(message)))
+            else:
+                if version[0] < 2 and len(message) > MTU_BUDGET:
+                    print("  WARNING: {} is {} B > {} B MTU budget; v1.0 has no "
+                          "multi-datagram support (RFC §5.6). Use --version 2.0."
+                          .format(MessageType(int(mtype)).name, len(message),
+                                  MTU_BUDGET))
+                sock.sendto(message, client)
         if version[0] >= 2:
             seq = (seq + 1) & 0xFFFF
 

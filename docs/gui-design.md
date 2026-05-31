@@ -112,6 +112,9 @@ optional (`pytest-qt`), kept minimal.
 
 ## Deferred (unchanged by this design)
 
-Real discovery algorithm; selectable telemetry fields (RFC §8); multi-datagram message
-reassembly (RFC §5.7) — the v2.0 single-datagram path is implemented and the CRC is validated
-(CRC-16/CCITT-FALSE, RFC §3.2), but splitting a message across datagrams is not yet handled.
+Real discovery algorithm; selectable telemetry fields (RFC §8).
+
+The v2.0 wire path is fully implemented: the CRC is validated (CRC-16/CCITT-FALSE, RFC §3.2)
+and large messages split across several datagrams are reassembled length-delimited (RFC §5.6,
+300 ms timeout, all-or-nothing) — exercised by `tools/sim.py --version 2.0 --descriptor
+spec/examples/telemetry_long_example.json`, whose descriptor reply spans three datagrams.
