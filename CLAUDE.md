@@ -70,14 +70,17 @@ These span multiple sections of the RFC; get them right when editing either side
   `TELEMETRY 0x0002`, `STOP 0x0003`); direction + payload disambiguate.
 - **Telemetry packets:** each value occupies an integer number of **32-bit words** on the wire
   (≤4-byte types → 1 word; `int64`/`uint64`/`double` → 2 words). `Payload length` is the
-  **total** logical payload size; a single datagram's byte count comes from the UDP datagram
-  length (`udp_len − 12 − 4`).
+  **total** logical payload size of the message. For a single-datagram message its byte count is
+  the UDP datagram length (`udp_len − 12 − 4`); in **v2.0** a telemetry message MAY span several
+  datagrams (RFC §5.6), so the byte count comes from reassembly, not one `udp_len` (one
+  header/trailer, one sequence + whole-message CRC per message). **v1.0 telemetry is
+  single-datagram only.**
 - **Versioning is `major.minor`** (two bytes). The RFC documents **v1.0** (sequence numbering and
   CRC fields present but **ignored/zero**; single-datagram only) and **v2.0** (sequence + CRC
   active; multi-datagram messages allowed). Don't conflate the two.
 - **Single client:** the server serves one client at a time; a command from a new
   source address supersedes the previous client and **resets session state including the
-  sequence counter**. Multi-datagram reassembly (RFC §5.7) depends on this.
+  sequence counter**. Multi-datagram reassembly (RFC §5.6) depends on this.
 - **Descriptors are static in v1.0**, sent as a UTF-8 JSON string with no NUL terminator, and
   must validate against `spec/Schema.json`. `bitfield` is always a `uint32`; bits map to the
   `bits[]` names from the LSB up.
