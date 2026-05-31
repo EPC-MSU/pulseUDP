@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pulseudp"
-version = "1.0.0"
+dynamic = ["version"]          # single source of truth: src/pulseudp/__init__.py
 description = "On-the-fly telemetry collection and visualization for Ethernet-capable microcontrollers"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -52,6 +52,10 @@ package = [
 # window, so the GUI starts cleanly.
 [project.gui-scripts]
 pulseudp = "pulseudp.app:run"
+
+[tool.setuptools.dynamic]
+# Read __version__ via AST (no import), so the version lives in exactly one place.
+version = { attr = "pulseudp.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
