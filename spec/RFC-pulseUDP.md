@@ -8,7 +8,7 @@
 
 ## 1. Overview
 
-Ethernet bandwidth in modern microcontrollers (100BASE-TX) is high enough to provide several synchronous data points per timestamp at the ~20 kHz rates typically used for motor control. For example, 8 full 32-bit words at a 20 kHz rate use less than 6% of the 100 Mbit/s capacity, even accounting for UDP overhead. This favors creation of a telemetry streaming protocol developed for 32-bit microcontrollers with Ethernet support - **pulseUDP**. The system requirements for microcontroller implementation are about 10 kbytes considering that the prerequisite UDP/IP stack usually takes about 10 times more. The protocol have two versions:
+Ethernet bandwidth in modern microcontrollers (100BASE-TX) is high enough to provide several synchronous data points per timestamp at the ~20 kHz rates typically used for motor control. For example, 8 full 32-bit words at a 20 kHz rate use less than 6% of the 100 Mbit/s capacity, even accounting for UDP overhead. This favors creation of a telemetry streaming protocol developed for 32-bit microcontrollers with Ethernet support - **pulseUDP**. The system requirements for microcontroller implementation are about 10 kbytes considering that the prerequisite UDP/IP stack usually takes about 10 times more. The protocol has two versions:
 
 * Lite one `v1.0` with hardcoded telemetry list, one UDP datagram per packet, no CRC check, no packet sequencing, no version check. Easier to implement, fast to compute on the microcontroller side.
 * Full one `v2.0` with user-selectable telemetry streams, multiple datagram packets, error detection.
@@ -27,7 +27,8 @@ A protocol is strictly request/response: the server only sends message(s) as a r
 
 - **Protocol:** UDP.
 - **Port:** `2102` (server listens here; client sends commands here).
-- **Byte order:** little-endian for all multi-byte fields.
+- **Byte order:** little-endian for all multi-byte fields. The sole exception is the
+  `GET_CHANNELS`/`SET_CHANNELS` channel bitmap (§4), sent most-significant word first.
 - **MTU budget:** one datagram payload is kept within a single Ethernet frame — **1472 bytes**
   of UDP payload (1500 MTU − 20 IP − 8 UDP). In **v1.0** every message MUST fit in a single
   datagram. From protocol **v2.0** onward **any** message MAY be split across multiple datagrams 
@@ -126,9 +127,9 @@ A message type is the high 16 bits of the word at offset 4 (see §3.1) and occup
 A request and the response it triggers carry the **same** message-type constant; direction and
 payload distinguish them.
 
-**Every request MUST produce a response.** `DESCRIPTION` and `STOP` are each answered by exactly
-one response message; `TELEMETRY` is answered by the telemetry stream, whose first datagram is
-the acknowledgement that streaming has begun. A client that does not observe the response within
+**Every request MUST produce a response.** `DESCRIPTION`, `STOP`, `GET_CHANNELS`, and
+`SET_CHANNELS` are each answered by exactly one response message; `TELEMETRY` is answered by the
+telemetry stream, whose first datagram acknowledges that streaming has begun. A client that does not observe the response within
 a timeout retransmits the request (idempotent: a repeated request simply restarts the same
 transaction).
 
@@ -137,16 +138,16 @@ transaction).
 | `DESCRIPTION` | `0x0001` | Get descriptor | request, empty payload | JSON descriptor (see §5), UTF-8, no NUL terminator |
 | `TELEMETRY` | `0x0002` | Telemetry stream | request to start, empty payload | streamed telemetry messages, with one or more packets (see §5.3); in **v2.0** a message MAY span several datagrams (§5.6), until stopped |
 | `STOP` | `0x0003` | Stop stream | request, empty payload | acknowledgement, empty payload (sent once streaming has ceased) |
-| `GET_CHANNELS` | `0x0004` | Get currently enabled telemetry channels (v2.0 only) | request, empty payload | acknowledgement, payload with one or more 32-bit words where each bit in order from the least significant bit in the last word signals whether the corresponding channel is enabled |
-| `SET_CHANNELS` | `0x0005` | Set currently enabled telemetry channels (v2.0 only) | request, the same payload as in the GET_CHANNELS command, but the client states which channels should be enabled | acknowledgement, the same payload as in GET_CHANNELS; may differ from the request when the server refuses the request |
+| `GET_CHANNELS` | `0x0004` | Read enabled channels (v2.0) | request, empty payload | the channel bitmap (defined below): the currently enabled channels |
+| `SET_CHANNELS` | `0x0005` | Set enabled channels (v2.0) | request, a channel bitmap (defined below): the channels to enable | the channel bitmap the server accepted; may differ from the request |
 
 ### 4.1 Session flow
 
 ```
-client                                      Server
+client                                      server
  |  DESCRIPTION (request)  ─────────────────►|   (records client source IP:port, determines the protocol)
  |◄────────────  DESCRIPTION (JSON reply)    |   ← response (required)
- |  GET_CHANNELS (v2.0 only)  ──────────────►|   ← get enabled channels list
+ |  GET_CHANNELS (v2.0 only)  ──────────────►|   (read enabled channels)
  |◄────────────  GET_CHANNELS (v2.0 only)    |   ← response (required)
  |  TELEMETRY (start request)  ─────────────►|
  |◄──────────────  TELEMETRY (packets)       |  ┐  first packet = ack (required)
@@ -161,9 +162,28 @@ until it observes that response. Because the protocol is explicitly request/resp
 request and its reply share a message type, the receiver distinguishes them by direction and
 payload — no heuristics.
 
-The protocol design allows client version descovery. Since version 1.0 server ignores the version number for the incoming packets, the client can send `v2.0` request and learn the server protocol version by its reply (§6.1).
+The protocol design allows client-side version discovery. Since a v1.0 server ignores the version number of incoming packets, the client can send a `v2.0` request and learn the server's protocol version from its reply (§6.1).
 
-There is a difference in the session handshake prerequisite for v1.0 and v2.0 protocol versions. In v1.0 protocol all descriptor telemetry fields are enabled and the telemetry list is immutable. So only the descriptor is required to parse telemetry. In v2.0 protocol the descriptor provides only the possible telemetry channels and two more commands are used to get the list of enabled channels and set the list. The structure of the `GET_CHANNELS`/`SET_CHANNELS` payload is pure binary to facilitate microcontroller implementation that would not require JSON parsing. The lesser bit in the last word corresponds to the first telemetry channel in the descriptor. If there are more than 32 channels, the second word appears in the payload and its lesser bit corresponds to the 33 channel in the descriptor list. The server may refuse to accept the new channels list. In the payload of `SET_CHANNELS` response the server states the best option it can offer for the client request. It may disable all channels, revert to the default list, keep the old list, truncate the required list up to its capabilities or do something else.
+The handshake prerequisite differs by version. In v1.0 every descriptor field is enabled and the
+list is immutable, so the descriptor alone suffices to parse telemetry. In v2.0 the descriptor
+lists only the *possible* channels; the client uses `GET_CHANNELS`/`SET_CHANNELS` to read and
+choose the enabled subset before streaming.
+
+**Channel bitmap.** The `GET_CHANNELS`/`SET_CHANNELS` payload is a pure-binary bitmap (no JSON, so
+a microcontroller needs no parser) of ⌈N/32⌉ `uint32` words, where *N* is the channel count in the
+descriptor. The bitmap is one big integer sent **most-significant word first**: its overall
+least-significant bit — the LSB of the **last** word — is the descriptor's first channel, and bit
+*k* (from 0) is descriptor channel *k*+1, where `1` means enabled. Each extra group of 32 channels
+prepends one more word. Only this word order is most-significant-first — the bytes **within** each
+`uint32` stay little-endian; this is the **one exception** to the little-endian rule of §2.
+
+Each descriptor entry is exactly one channel, in listed order. A `bitfield` is a single channel:
+its one bit enables or disables the whole bitfield (all of its flags) together — individual flags
+cannot be toggled.
+
+A `SET_CHANNELS` response need not echo the request: the server returns the set it actually
+accepted, which may keep the previous list, revert to a default, truncate to its capacity, or
+disable everything.
 
 ## 5. Payload: telemetry packets and the JSON descriptor
 
@@ -181,7 +201,7 @@ The descriptor supports the list of the telemetry values, describing their
 
 The special flag type is also supported so binary flags can be sent along with numbers.
 
-There is a difference in interpretation of JSON descriptor between the protocol versions. In version `1.0` the descriptor list exactly the fields of the telemetry package. In version `v2.0` the list consists of possible telemetry channels that the server can provide. Separate negotiation of the enabled channels is required between client and server to get the actual telemetry package list and parse the payload. The number of the telemetry packages inside one message is derived from the number of the data points and their size.
+There is a difference in interpretation of JSON descriptor between the protocol versions. In v1.0 the descriptor lists exactly the fields of the telemetry packet. In v2.0 the list consists of the possible telemetry channels the server can provide; a separate channel negotiation (§4) yields the enabled subset needed to parse the payload. The number of telemetry packets in one message is derived from the data-point count and their size.
 
 The descriptor also carries a `version` (required) — its own revision in semantic-versioning form, e.g. `1.0.0`. This descriptor version is independent of the protocol version in the message header (§3); it lets a client recognise when the telemetry layout has changed. An optional `id` object may carry server identification (such as device name, serial number, and firmware version) for display; its inner structure is not yet fixed.
 
@@ -193,7 +213,7 @@ A worked example descriptor and a validator are provided under `examples/`:
 
 - `examples/telemetry_example.json` — an example descriptor (illustrative only, not normative).
 - `examples/validate.py` — validates a descriptor against the schema:
-  `python examples/validate.py examples/telemetry_example.json Schema.json` (requires the `jsonschema`package).
+  `python examples/validate.py examples/telemetry_example.json Schema.json` (requires the `jsonschema` package).
 
 ### 5.2 Types and on-wire width
 
@@ -305,12 +325,12 @@ identifies the *message* (for stream-level loss detection), not the pieces withi
 | Capability | v1.0 (lite) | v2.0 (full) |
 |---|---|---|
 | Magic / version / type / payload-length header | server sets its version but doesn't check client's version | ✔ |
-| Simple handshake (just `DESCRIPTION` request/response) | ✔ | x |
+| Telemetry ready after `DESCRIPTION` alone (no channel negotiation) | ✔ | ✗ |
 | Single-client session (new client supersedes the old) | ✔ | ✔ |
 | **Sequence number** | field present, sent as `0`, ignored | active, monotonic, used for loss detection |
 | **CRC trailer** (Reserved + CRC-16) | present, sent as `0` and ignored | present, filled and validated |
 | **Multi-datagram messages** (one header/trailer, payload split over datagrams) | not allowed — every message fits one datagram | supported; in-order, all-or-nothing, whole-message CRC |
-| User selectable telemetry channels | x | ✔ |
+| User-selectable telemetry channels | ✗ | ✔ |
 
 `major.minor` is carried as two bytes (`Version major`, `Version minor`). A client MUST
 read the version before parsing payload semantics, since major versions are not required to be
@@ -321,7 +341,7 @@ and `STOP` requests carry no payload, and the only header fields that differ bet
 v2.0 are `sequence_number` and the CRC — which v1.0 already ignores. A server therefore
 MUST answer a well-formed request **regardless of the request's version field**, applying its
 own version's rules, and MUST stamp the response with the **server's own** version. A v1.0
-server in particular ignores the client's version exactly as it ignores the clients's
+server in particular ignores the client's version exactly as it ignores the client's
 sequence and CRC. This is what makes the client-side version discovery in §6.1 a single
 round-trip with no fallback.
 
