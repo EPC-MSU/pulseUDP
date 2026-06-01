@@ -142,6 +142,7 @@ class UdpClient:
         self._last_seq = None
         self._reasm = None
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(('', DEFAULT_PORT))
         sock.settimeout(_SOCK_TIMEOUT)
         self._sock = sock
         self._rx_thread = threading.Thread(
