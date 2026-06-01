@@ -29,11 +29,12 @@ def _pack(ts, va, cur, flags, counter):
             + struct.pack("<i", counter))
 
 
-def test_packet_size_and_timestamp_detection():
+def test_packet_size_and_plot_fields():
     d = Descriptor.from_json(EXAMPLE)
     assert d.packet_size == 5 * 4           # five single-word fields
-    assert d.timestamp_field.name == "Timestamp"
-    assert [f.name for f in d.plot_fields] == ["VoltageA", "Current", "Flags", "Counter"]
+    # Every field is plottable.
+    assert [f.name for f in d.plot_fields] == [
+        "Timestamp", "VoltageA", "Current", "Flags", "Counter"]
 
 
 def test_decode_roundtrip_applies_mult_and_signs():

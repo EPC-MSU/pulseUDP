@@ -89,8 +89,9 @@ def _sample(descriptor: Descriptor, n: int, enabled=None):
     for i, f in enumerate(descriptor.fields):
         if enabled is not None and not enabled[i]:
             continue   # disabled channel (v2.0 SET_CHANNELS): omit from the packet
-        if i == descriptor.timestamp_index:
-            # Timestamp in ms tick if mult looks like 0.001, else raw counter.
+        if f.name.lower() in ("timestamp", "time"):
+            # A clock-like channel: emit a monotonic ramp (an ms tick when mult
+            # is 0.001) so the synthetic stream reads naturally.
             value = n
         elif f.is_bitfield:
             # Walk a single set bit across the named (non-Reserved) bits.

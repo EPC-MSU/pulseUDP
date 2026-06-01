@@ -29,21 +29,24 @@ def test_grouping_rules():
     assert groups["Flags"].kind == "bitfield"
     # Reserved bit excluded from traces.
     assert {t.label for t in groups["Flags"].traces} == {"Run", "Fault"}
-    assert model.channel_keys == ["VoltageA", "VoltageB", "Speed",
+    # The "s"-units field shares a plot like any other channel.
+    assert groups["s"].kind == "numeric" and len(groups["s"].traces) == 1
+    assert model.channel_keys == ["Timestamp", "VoltageA", "VoltageB", "Speed",
                                   "Flags.Run", "Flags.Fault"]
 
 
-def test_extract_returns_time_and_bit_traces():
+def test_extract_returns_sample_count_and_all_channels():
     import struct
     d = Descriptor.from_json(DESC)
     model = PlotModel(d)
-    payload = (struct.pack("<I", 5000)        # Timestamp -> 5.0 s
+    payload = (struct.pack("<I", 5000)        # Timestamp -> 5.0
                + struct.pack("<hh", 100, 0)   # VoltageA
                + struct.pack("<hh", 200, 0)   # VoltageB
                + struct.pack("<i", 7)         # Speed
                + struct.pack("<I", 0b101))    # Run + Fault
-    t, flat = model.extract(d.decode(payload))
-    assert np.allclose(t, [5.0])
+    n, flat = model.extract(d.decode(payload))
+    assert n == 1
+    assert np.allclose(flat["Timestamp"], [5.0])
     assert np.allclose(flat["VoltageA"], [1.0])
     assert np.array_equal(flat["Flags.Run"], [1.0])
     assert np.array_equal(flat["Flags.Fault"], [1.0])
@@ -56,44 +59,43 @@ def test_flatten_subset_omits_disabled_then_ring_fills_nan():
     model = PlotModel(d)
     channels = {"Timestamp": np.array([1.0, 2.0]),
                 "VoltageA": np.array([0.1, 0.2])}     # VoltageB/Speed/Flags off
-    t, flat = model.flatten(channels)
-    assert t is not None
-    assert np.allclose(t, [1.0, 2.0])
-    assert set(flat) == {"VoltageA"}
+    n, flat = model.flatten(channels)
+    assert n == 2
+    assert set(flat) == {"Timestamp", "VoltageA"}
     rb = RingBuffer(model.channel_keys)
-    rb.append(t, flat)
-    _, chans = rb.snapshot()
+    rb.append(n, flat)
+    x, chans = rb.snapshot()
+    assert np.array_equal(x, [0.0, 1.0])              # synthetic per-sample index
     assert np.allclose(chans["VoltageA"], [0.1, 0.2])
     assert np.all(np.isnan(chans["VoltageB"]))        # disabled numeric -> NaN
     assert np.all(np.isnan(chans["Flags.Run"]))       # disabled bitfield -> NaN
 
 
-def test_flatten_without_timebase_returns_none():
+def test_flatten_empty_channels_returns_zero():
     d = Descriptor.from_json(DESC)
     model = PlotModel(d)
-    t, flat = model.flatten({"VoltageA": np.array([1.0])})
-    assert t is None and flat == {}
+    n, flat = model.flatten({})
+    assert n == 0 and flat == {}
 
 
 def test_ring_buffer_trims_to_window():
-    rb = RingBuffer(["a"], window_s=1.0)
+    rb = RingBuffer(["a"], window_n=3)
     for i in range(10):
-        t = np.array([i * 0.5], dtype=np.float64)   # 0.0, 0.5, ... 4.5
-        rb.append(t, {"a": np.array([float(i)])})
-    t, chans = rb.snapshot()
-    # latest is 4.5; window 1.0 keeps samples with t >= 3.5 (chunk-granular).
-    assert t[-1] == 4.5
-    assert t[0] >= 3.0
-    assert rb.latest_time() == 4.5
+        rb.append(1, {"a": np.array([float(i)])})   # one sample per append, X = 0..9
+    x, chans = rb.snapshot()
+    # latest index is 9; window 3 keeps indices >= 6 (chunk-granular).
+    assert x[-1] == 9
+    assert x[0] >= 6
+    assert rb.latest_index() == 9
 
 
 def test_ring_buffer_set_window_shrinks():
-    rb = RingBuffer(["a"], window_s=10.0)
+    rb = RingBuffer(["a"], window_n=100)
     for i in range(20):
-        rb.append(np.array([float(i)]), {"a": np.array([float(i)])})
-    rb.set_window(2.0)
-    t, _ = rb.snapshot()
-    assert t[0] >= 16.0 and t[-1] == 19.0
+        rb.append(1, {"a": np.array([float(i)])})   # X = 0..19
+    rb.set_window(3)
+    x, _ = rb.snapshot()
+    assert x[0] >= 16 and x[-1] == 19
 
 
 def test_sequence_gap_detection_logs():

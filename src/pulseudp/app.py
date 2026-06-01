@@ -40,10 +40,11 @@ from .protocol import Descriptor
 
 DEFAULT_PORT = 2102
 REDRAW_HZ = 30
-DEFAULT_VIEW_S = 1.0        # initial zoom: ~1 s per screen (wheel-controlled)
-DEFAULT_HISTORY_S = 10.0    # initial rolling-history retention (spin-box-controlled)
-MIN_WINDOW_S = 0.01
-MAX_WINDOW_S = 600.0
+# The X axis counts samples, not seconds: windows are sample counts.
+DEFAULT_VIEW_N = 500        # initial zoom: samples per screen (wheel-controlled)
+DEFAULT_HISTORY_N = 5000    # initial rolling-history retention (spin-box-controlled)
+MIN_WINDOW_N = 2
+MAX_WINDOW_N = 10_000_000
 
 # Trace colour palette (cycled across all plots).
 _PALETTE = [
@@ -78,7 +79,7 @@ class _Bridge(QtCore.QObject):
 class TelemetryViewBox(pg.ViewBox):
     """ViewBox whose wheel zoom obeys the running/stopped state machine.
 
-    The wheel always changes the time window by a factor of two. While the
+    The wheel always changes the sample window by a factor of two. While the
     stream is running the window stays anchored to the latest sample (the main
     window keeps following); while stopped it zooms around the mouse pointer.
     """
@@ -111,11 +112,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._model: Optional[PlotModel] = None
         self._ring: Optional[RingBuffer] = None
         self._running = False
-        # Two independent time windows: how much data we KEEP (history, set by the
-        # spin box) vs how much we SHOW (view, set by the wheel). The wheel never
-        # touches retention, so zooming cannot discard data.
-        self._history_s = DEFAULT_HISTORY_S
-        self._view_s = DEFAULT_VIEW_S
+        # Two independent sample windows: how much data we KEEP (history, set by
+        # the spin box) vs how much we SHOW (view, set by the wheel), both counted
+        # in samples. The wheel never touches retention, so zooming cannot discard
+        # data.
+        self._history_n = DEFAULT_HISTORY_N
+        self._view_n = float(DEFAULT_VIEW_N)
 
         self._plots: List[pg.PlotItem] = []
         self._visible_plots: List[pg.PlotItem] = []   # currently laid-out subset
@@ -132,7 +134,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._selectable = False        # True once a v2.0 session is negotiated
         self._suppress_check = False    # guard against re-entrant checkbox updates
         self._n_channels = 0
-        self._ts_index = 0              # time-base channel: always kept enabled
 
         self._bridge = _Bridge()
         self._bridge.log.connect(self._on_log)
@@ -204,13 +205,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_btn.clicked.connect(self._on_start_stop)
         row.addWidget(self._start_btn)
 
-        row.addWidget(QtWidgets.QLabel("History (s):"))
-        self._history_spin = QtWidgets.QDoubleSpinBox()
-        self._history_spin.setRange(MIN_WINDOW_S, MAX_WINDOW_S)
-        self._history_spin.setDecimals(2)
-        self._history_spin.setValue(DEFAULT_HISTORY_S)
+        row.addWidget(QtWidgets.QLabel("History (samples):"))
+        self._history_spin = QtWidgets.QSpinBox()
+        self._history_spin.setRange(MIN_WINDOW_N, MAX_WINDOW_N)
+        self._history_spin.setValue(DEFAULT_HISTORY_N)
         self._history_spin.setToolTip(
-            "How much recent data to keep (rolling history). "
+            "How many recent samples to keep (rolling history). "
             "Independent of the wheel zoom — zooming never discards data.")
         self._history_spin.valueChanged.connect(self._on_history_changed)
         row.addWidget(self._history_spin)
@@ -298,19 +298,18 @@ class MainWindow(QtWidgets.QMainWindow):
             client = self._client
             self._run_async(lambda: client.stop_stream(timeout=1.0))
 
-    def _on_history_changed(self, value: float) -> None:
+    def _on_history_changed(self, value: int) -> None:
         # The spin box controls data RETENTION only — never the zoom.
-        self._history_s = float(value)
+        self._history_n = int(value)
         if self._ring is not None:
-            self._ring.set_window(self._history_s)
+            self._ring.set_window(self._history_n)
 
     # -- bridge slots (GUI thread) --------------------------------------------
 
     def _on_descriptor(self, descriptor: Descriptor) -> None:
         self._model = PlotModel(descriptor)
-        self._ring = RingBuffer(self._model.channel_keys, window_s=self._history_s)
+        self._ring = RingBuffer(self._model.channel_keys, window_n=self._history_n)
         self._n_channels = len(descriptor.fields)
-        self._ts_index = descriptor.timestamp_index
         # Channel selection is a v2.0 feature; in v1.0 the list is immutable.
         self._selectable = (self._client is not None
                             and self._client.version[0] >= 2)
@@ -362,10 +361,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # them to trace keys and the RingBuffer fills disabled ones with NaN.
         if self._model is None or self._ring is None:
             return
-        t, flat = self._model.flatten(channels)
-        if t is None:
-            return
-        self._ring.append(t, flat)
+        n, flat = self._model.flatten(channels)
+        self._ring.append(n, flat)
 
     # -- plot building & redraw -----------------------------------------------
 
@@ -379,23 +376,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._channel_checks = {}
         self._link_vb = None
         color_i = 0
-        ts_name = descriptor.timestamp_field.name
         # Field name -> descriptor index (= channel index in the bitmap, RFC §4).
         index_by_name = {f.name: i for i, f in enumerate(descriptor.fields)}
 
-        # Telemetry tree: timestamp first (as time base, no checkbox), then fields.
-        ts_item = QtWidgets.QTreeWidgetItem(
-            ["", ts_name + "  (time base)", descriptor.timestamp_field.type])
-        ts_item.setForeground(1, QtGui.QBrush(QtGui.QColor("#888")))
-        self._tree.addTopLevelItem(ts_item)
-
+        # Telemetry tree: one row per field.
         field_by_name = {f.name: f for f in descriptor.fields}
         row = 0
         for gi, group in enumerate(self._model.groups):
             plot = self._graphs.addPlot(
                 row=gi, col=0, viewBox=TelemetryViewBox(self))
             plot.showGrid(x=True, y=True, alpha=0.3)
-            plot.setLabel("bottom", "time", units="s")
+            plot.setLabel("bottom", "sample")
             if group.units:
                 plot.setLabel("left", group.units)
             else:
@@ -498,7 +489,6 @@ class MainWindow(QtWidgets.QMainWindow):
         desired = [True] * self._n_channels
         for idx, chk in self._channel_checks.items():
             desired[idx] = chk.isChecked()
-        desired[self._ts_index] = True      # the time base must stay enabled
         self._set_checks_enabled(False)      # lock the boxes during the round trip
         client = self._client
 
@@ -567,21 +557,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def _redraw(self) -> None:
         if self._ring is None or self._model is None:
             return
-        t, chans = self._ring.snapshot()
-        if t.size == 0:
+        x, chans = self._ring.snapshot()
+        if x.size == 0:
             return
         for key, curve in self._curves.items():
             y = chans.get(key)
-            if y is None or y.size != t.size:
+            if y is None or y.size != x.size:
                 continue
             if key in self._bit_offset:
-                curve.setData(t, y * 0.8 + self._bit_offset[key])
+                curve.setData(x, y * 0.8 + self._bit_offset[key])
             else:
-                curve.setData(t, y)
+                curve.setData(x, y)
         if self._running and self._primary_plot is not None:
-            latest = float(t[-1])
+            latest = float(x[-1])
             self._primary_plot.getViewBox().setXRange(
-                latest - self._view_s, latest, padding=0)
+                latest - self._view_n, latest, padding=0)
 
     # -- wheel state machine --------------------------------------------------
 
@@ -589,7 +579,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # The wheel changes the VIEW width only; it never trims the RingBuffer, so
         # data outside the visible range is retained (up to the history size) and
         # reappears when zooming back out.
-        self._view_s = min(MAX_WINDOW_S, max(MIN_WINDOW_S, self._view_s * factor))
+        self._view_n = min(MAX_WINDOW_N, max(MIN_WINDOW_N, self._view_n * factor))
         if not self._running and self._primary_plot is not None and x is not None:
             # Stopped: zoom around the pointer (X is linked across plots).
             vb = self._primary_plot.getViewBox()

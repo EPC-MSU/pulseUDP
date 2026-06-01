@@ -6,8 +6,12 @@ Two pieces:
   of plot groups the GUI draws (units-grouped numeric plots, one-per-unitless
   numeric plot, one digital plot per bitfield) and knows how to flatten a
   decoded packet array into the flat per-trace channels the buffer stores.
-* :class:`RingBuffer` keeps a rolling, time-bounded history of those channels.
-  Its window length (seconds) is user-selectable at runtime.
+* :class:`RingBuffer` keeps a rolling history of those channels, bounded by a
+  count of the most recent samples. Its window length (number of samples) is
+  user-selectable at runtime.
+
+The X axis is a synthetic per-sample counter the buffer generates on append —
+the index of each sample in the stream.
 
 Neither piece touches Qt, so both are unit-testable headless.
 """
@@ -20,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .protocol import Descriptor, Field
+from .protocol import Descriptor
 
 
 # --- Plot model --------------------------------------------------------------
@@ -54,7 +58,8 @@ class PlotModel:
     * numeric fields with no ``units`` → one plot each;
     * each ``bitfield`` → its own digital plot, one trace per non-``Reserved`` bit.
 
-    The time-base field (``descriptor.timestamp_field``) is never plotted.
+    Every field is plotted; the X axis is a synthetic per-sample counter the
+    :class:`RingBuffer` generates.
     """
 
     def __init__(self, descriptor: Descriptor) -> None:
@@ -92,42 +97,35 @@ class PlotModel:
         """All trace keys, in plot order — the RingBuffer's channel set."""
         return list(self._channel_keys)
 
-    def extract(self, packets: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """Flatten a decoded packet array into (time, {trace_key: values}).
-
-        Decoded against the full descriptor, so the time base is always present.
-        """
-        t, flat = self.flatten(self.descriptor.channels(packets))
-        assert t is not None        # full descriptor always carries the time base
-        return t, flat
+    def extract(self, packets: np.ndarray) -> Tuple[int, Dict[str, np.ndarray]]:
+        """Flatten a decoded packet array into (n_samples, {trace_key: values})."""
+        return self.flatten(self.descriptor.channels(packets))
 
     def flatten(self, channels: Dict[str, np.ndarray]
-                ) -> Tuple[Optional[np.ndarray], Dict[str, np.ndarray]]:
-        """Map per-field channel arrays to (time, {trace_key: values}).
+                ) -> Tuple[int, Dict[str, np.ndarray]]:
+        """Map per-field channel arrays to (n_samples, {trace_key: values}).
 
         ``channels`` is :meth:`Descriptor.channels` output — physical-unit arrays
-        keyed by field name, possibly covering only a v2.0 *enabled* subset. Time
-        is the time-base field in seconds; bitfields are expanded into 0/1 bit
-        traces. Fields absent from ``channels`` (disabled channels) are skipped —
-        the RingBuffer fills their keys with NaN, so they draw as gaps. Returns
-        ``(None, {})`` if the time-base channel itself is absent.
+        keyed by field name, possibly covering only a v2.0 *enabled* subset.
+        Bitfields are expanded into 0/1 bit traces. Fields absent from
+        ``channels`` (disabled channels) are skipped — the RingBuffer fills their
+        keys with NaN, so they draw as gaps. ``n_samples`` is the packet count
+        (the length of every channel array), or 0 if ``channels`` is empty; the
+        RingBuffer generates the per-sample X index from it.
         """
-        t = channels.get(self.descriptor.timestamp_field.name)
-        if t is None:
-            return None, {}
-        t = t.astype(np.float64)
-
+        n = 0
         flat: Dict[str, np.ndarray] = {}
         for f in self.descriptor.plot_fields:
             col = channels.get(f.name)
             if col is None:
                 continue   # disabled channel (v2.0): omitted -> NaN in the buffer
+            n = len(col)
             if f.is_bitfield:
                 for name, arr in Descriptor.bit_traces(f, col).items():
                     flat["{}.{}".format(f.name, name)] = arr.astype(np.float64)
             else:
                 flat[f.name] = col
-        return t, flat
+        return n, flat
 
 
 # --- Rolling history ---------------------------------------------------------
@@ -136,70 +134,81 @@ class PlotModel:
 class RingBuffer:
     """Thread-safe rolling history of a fixed set of channels.
 
+    The X axis is a synthetic per-sample counter: every appended sample gets the
+    next integer index in the stream, so the X value of a sample is its ordinal
+    position since the last :meth:`clear`. A dropped datagram (silently in v1.0,
+    logged via ``seq_gap`` in v2.0) just means the index skips the lost samples
+    without a visible gap.
+
     Stored as a list of per-append chunks so appends are O(1) and trimming
     drops whole chunks; the GUI concatenates the retained window on demand
-    (once per redraw, not per packet). Retains roughly ``window_s`` seconds of
-    the most recent data, keyed off the latest sample's timestamp.
+    (once per redraw, not per packet). Retains roughly ``window_n`` of the most
+    recent samples.
     """
 
-    def __init__(self, channel_keys: List[str], window_s: float = 5.0) -> None:
+    def __init__(self, channel_keys: List[str], window_n: int = 5000) -> None:
         self._keys = list(channel_keys)
-        self._window_s = float(window_s)
+        self._window_n = int(window_n)
         self._lock = threading.Lock()
-        self._t_chunks: List[np.ndarray] = []
+        self._x_chunks: List[np.ndarray] = []
         self._chunks: Dict[str, List[np.ndarray]] = {k: [] for k in self._keys}
-        self._latest_t: Optional[float] = None
+        self._n_total = 0          # samples seen since clear() == next X index
 
     @property
-    def window_s(self) -> float:
-        return self._window_s
+    def window_n(self) -> int:
+        return self._window_n
 
-    def set_window(self, window_s: float) -> None:
-        """Change the retained window length (seconds) and trim immediately."""
+    def set_window(self, window_n: int) -> None:
+        """Change the retained window length (samples) and trim immediately."""
         with self._lock:
-            self._window_s = float(window_s)
+            self._window_n = int(window_n)
             self._trim_locked()
 
     def clear(self) -> None:
         with self._lock:
-            self._t_chunks = []
+            self._x_chunks = []
             self._chunks = {k: [] for k in self._keys}
-            self._latest_t = None
+            self._n_total = 0
 
-    def append(self, t: np.ndarray, channels: Dict[str, np.ndarray]) -> None:
-        """Append a chunk of samples. ``channels`` must cover every channel key."""
-        if t.size == 0:
+    def append(self, n: int, channels: Dict[str, np.ndarray]) -> None:
+        """Append ``n`` samples, assigning them the next ``n`` X indices.
+
+        ``channels`` maps trace keys to length-``n`` arrays; keys absent from it
+        (disabled v2.0 channels) are filled with NaN so they draw as gaps.
+        """
+        if n <= 0:
             return
         with self._lock:
-            self._t_chunks.append(np.asarray(t, dtype=np.float64))
+            x = np.arange(self._n_total, self._n_total + n, dtype=np.float64)
+            self._n_total += n
+            self._x_chunks.append(x)
             for k in self._keys:
                 col = channels.get(k)
                 if col is None:
-                    col = np.full(t.size, np.nan, dtype=np.float64)
+                    col = np.full(n, np.nan, dtype=np.float64)
                 self._chunks[k].append(np.asarray(col, dtype=np.float64))
-            self._latest_t = float(t[-1])
             self._trim_locked()
 
     def _trim_locked(self) -> None:
-        if self._latest_t is None:
+        if not self._x_chunks:
             return
-        cutoff = self._latest_t - self._window_s
-        # Drop leading chunks entirely older than the cutoff.
-        while len(self._t_chunks) > 1 and self._t_chunks[0][-1] < cutoff:
-            self._t_chunks.pop(0)
+        cutoff = (self._n_total - 1) - self._window_n
+        # Drop leading chunks whose samples are all older than the cutoff index.
+        while len(self._x_chunks) > 1 and self._x_chunks[0][-1] < cutoff:
+            self._x_chunks.pop(0)
             for k in self._keys:
                 self._chunks[k].pop(0)
 
-    def latest_time(self) -> Optional[float]:
+    def latest_index(self) -> Optional[int]:
         with self._lock:
-            return self._latest_t
+            return self._n_total - 1 if self._n_total else None
 
     def snapshot(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """Return a concatenated copy of the retained window: (time, channels)."""
+        """Return a concatenated copy of the retained window: (x_index, channels)."""
         with self._lock:
-            if not self._t_chunks:
+            if not self._x_chunks:
                 empty = np.empty(0, dtype=np.float64)
                 return empty, {k: np.empty(0, dtype=np.float64) for k in self._keys}
-            t = np.concatenate(self._t_chunks)
+            x = np.concatenate(self._x_chunks)
             chans = {k: np.concatenate(self._chunks[k]) for k in self._keys}
-            return t, chans
+            return x, chans

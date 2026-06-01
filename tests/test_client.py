@@ -207,7 +207,7 @@ def _channel_client(reply_enabled, version=(2, 0)):
     """A v2.0 client whose ``_send`` answers GET/SET_CHANNELS with a canned bitmap.
 
     The descriptor is the 2-field ``_DESC_JSON`` (Timestamp, V), so a reply of
-    ``[True, False]`` enables only the time base.
+    ``[True, False]`` enables only the first channel.
     """
     c = UdpClient("127.0.0.1", version=version)
     c._sock = _FakeSock()
@@ -225,7 +225,7 @@ def _channel_client(reply_enabled, version=(2, 0)):
 
 
 def test_get_channels_reads_bitmap_and_sets_active_subset():
-    c = _channel_client([True, False])              # only the time base enabled
+    c = _channel_client([True, False])              # only the first channel enabled
     enabled = c.get_channels(timeout=0.3, retries=2)
     assert enabled == [True, False]
     assert c.enabled_channels == [True, False]

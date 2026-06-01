@@ -43,8 +43,8 @@ python spec/examples/validate.py spec/examples/telemetry_example.json spec/Schem
 
 The GUI splits acquisition from rendering: a receiver thread decodes datagrams (NumPy
 structured-dtype) into a thread-safe `RingBuffer`; a `QTimer` redraws curves on the GUI thread
-(never paint Qt from a worker thread). X-axis = an auto-detected timestamp field; the rolling
-history window is user-selectable. See `docs/gui-design.md`.
+(never paint Qt from a worker thread). X-axis = a synthetic per-sample counter the client
+generates; the rolling history window is user-selectable in samples. See `docs/gui-design.md`.
 
 ### Python environment gotcha (this machine)
 

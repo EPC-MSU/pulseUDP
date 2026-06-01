@@ -8,11 +8,14 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
 
 - **Qt binding:** PyQt5. Best support across the `requires-python >=3.8` range and most
   battle-tested with pyqtgraph. PyQt5 is **GPLv3**, so the released app is GPLv3.
-- **Time (X) axis:** auto-detect a timestamp field — a field named `timestamp`/`time`
-  (case-insensitive), else the first field — converted by its `mult` to seconds. Fall back
-  to host arrival time if no plausible field exists. The timestamp field is not plotted.
-- **History:** rolling ring buffer whose window length (seconds) is **user-selectable in the
-  GUI**. Older data is discarded; post-Stop pan/zoom is bounded to the retained window.
+- **X axis:** a synthetic **per-sample counter** the client generates — each received
+  telemetry packet gets the next integer index. A datagram lost in transit (silently in v1.0,
+  logged as a `seq_gap` row in v2.0) simply means the index skips the lost samples, with no
+  visible gap. Note the granularity is *message*, not *packet*: v2.0 sequence numbers detect a
+  missing message but not how many packets it held.
+- **History:** rolling ring buffer whose window length (number of **samples**) is
+  **user-selectable in the GUI**. Older data is discarded; post-Stop pan/zoom is bounded to the
+  retained window.
 - **Test source:** a UDP simulator (`tools/sim.py`), since the microcontroller firmware is
   out of scope and no real device exists.
 - **Grouping:** fields sharing `units` share one plot; **unitless fields get one plot each**;
@@ -48,7 +51,8 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
   transactions with retransmit timeout, receiver thread, Qt signals for samples + log events.
 - `discovery.py` *(new)* — pluggable `Discovery` interface with a no-op stub backend (Search
   returns nothing for now; keeps the public RFC discovery-free).
-- `model.py` *(new)* — `RingBuffer`, channel/units grouping, time-axis resolution.
+- `model.py` *(new)* — `RingBuffer` (sample-counter X, sample-bounded history), channel/units
+  grouping.
 - `app.py` *(replaces stub)* — `MainWindow` and panels.
 - `tools/sim.py` *(new)* — UDP telemetry simulator.
 
@@ -79,20 +83,19 @@ one call; multipliers apply as vectorized float ops. `n_packets = payload_len //
 
 1. **Connection bar (top):** `[Search]` → device list ↔ editable IP field (list selection
    fills it; manual edit allowed) → `[Connect]` (sends `DESCRIPTION`) → status label →
-   `[Start/Stop]` telemetry → rolling-window size selector (seconds).
+   `[Start/Stop]` telemetry → rolling-window size selector (samples).
 2. **Telemetry list (left):** one row per field — name, type, a checkbox **checked + disabled**
    (reserved for the future selectable-fields feature, RFC §8), and a color swatch matching
-   the curve. The timestamp field is tagged as the time base, not plotted.
+   the curve. Every field is plotted; the X axis is a synthetic sample counter.
 3. **Graph area (center/right):** one `PlotWidget` per units group; one per unitless field;
    one stacked digital plot per bitfield.
 4. **Log dock (bottom, collapsible):** host-time timestamps; categories listed above.
 
-## Time axis & zoom/pan state machine
+## X axis & zoom/pan state machine
 
-- **X base:** auto-detected timestamp field × its `mult` → seconds; fall back to host arrival
-  time.
-- **Running:** X window width `W` (default **1.0 s**); the view auto-scrolls so the right edge
-  tracks the latest sample. Wheel: `W ×= 0.5 / ×2` (clamped), still following latest. Y
+- **X base:** a synthetic per-sample counter (sample index since the buffer was last cleared).
+- **Running:** X window width `W` (default **500 samples**); the view auto-scrolls so the right
+  edge tracks the latest sample. Wheel: `W ×= 0.5 / ×2` (clamped), still following latest. Y
   autoscales to the visible window.
 - **Stopped:** free pan; wheel zooms in **×2 steps anchored at the mouse pointer** (custom
   `wheelEvent` overriding pyqtgraph's continuous zoom). No auto-follow.
@@ -107,8 +110,8 @@ and the `STOP` ack.
 ## Testing
 
 Headless units: descriptor → decode-plan correctness, decode round-trip vs `tools/sim.py`,
-ring-buffer trim-by-window, time-axis resolution, sequence-gap detection. GUI smoke test
-optional (`pytest-qt`), kept minimal.
+ring-buffer trim-by-sample-window, sequence-gap detection. GUI smoke test optional
+(`pytest-qt`), kept minimal.
 
 ## Deferred (unchanged by this design)
 
