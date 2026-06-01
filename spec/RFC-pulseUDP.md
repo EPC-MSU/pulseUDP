@@ -8,7 +8,7 @@
 
 ## 1. Overview
 
-Ethernet bandwidth in modern microcontrollers (100BASE-TX) is high enough to provide several synchronous data points per timestamp at the ~20 kHz rates typically used for motor control. For example, 8 full 32-bit words at a 20 kHz rate use less than 6% of the 100 Mbit/s capacity, even accounting for UDP overhead. This favors creation of a telemetry streaming protocol developed for 32-bit microcontrollers with Ethernet support - **pulseUDP**. The system requirements for microcontroller implementation are about 10 kbytes considering that the prerequisite UDP/IP stack usually takes about 10 times more. The protocol has two versions:
+Ethernet bandwidth in modern microcontrollers (100BASE-TX) is high enough to provide several synchronous data points per telemetry packet at the ~20 kHz rates typically used for motor control. For example, 8 full 32-bit words at a 20 kHz rate use less than 6% of the 100 Mbit/s capacity, even accounting for UDP overhead. This favors creation of a telemetry streaming protocol developed for 32-bit microcontrollers with Ethernet support - **pulseUDP**. The system requirements for microcontroller implementation are about 10 kbytes considering that the prerequisite UDP/IP stack usually takes about 10 times more. The protocol has two versions:
 
 * Lite one `v1.0` with hardcoded telemetry list, one UDP datagram per packet, no CRC check, no packet sequencing, no version check. Easier to implement, fast to compute on the microcontroller side.
 * Full one `v2.0` with user-selectable telemetry streams, multiple datagram packets, error detection.
