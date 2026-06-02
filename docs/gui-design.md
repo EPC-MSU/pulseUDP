@@ -13,9 +13,14 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
   logged as a `seq_gap` row in v2.0) simply means the index skips the lost samples, with no
   visible gap. Note the granularity is *message*, not *packet*: v2.0 sequence numbers detect a
   missing message but not how many packets it held.
-- **History:** rolling ring buffer whose window length (number of **samples**) is
-  **user-selectable in the GUI**. Older data is discarded; post-Stop pan/zoom is bounded to the
-  retained window.
+- **History:** a fixed, preallocated rolling **ring buffer** whose window length (number of
+  **samples**) is **user-selectable in the GUI** from a fixed list of magnitudes
+  (`1K · 10K · 100K · 1M · 10M · 100M · 1G`, default **1M**). Older data is discarded; post-Stop
+  pan/zoom is bounded to the retained window. A **min/max decimation pyramid** alongside the ring
+  keeps redraw cost bounded by the plot's pixel width, so the window can be pushed into the
+  multi-GiB range without the GUI lagging — see [Rendering pipeline](#rendering-pipeline-ring-buffer--minmax-pyramid).
+  A requested size that would not fit in free RAM is **rejected** (the previous, smaller size is
+  kept) so the client never tries to allocate beyond memory.
 - **Test source:** a UDP simulator (`tools/sim.py`), since the microcontroller firmware is
   out of scope and no real device exists.
 - **Grouping:** fields sharing `units` share one plot; **unitless fields get one plot each**;
@@ -99,6 +104,57 @@ one call; multipliers apply as vectorized float ops. `n_packets = payload_len //
   autoscales to the visible window.
 - **Stopped:** free pan; wheel zooms in **×2 steps anchored at the mouse pointer** (custom
   `wheelEvent` overriding pyqtgraph's continuous zoom). No auto-follow.
+- **Zoom/resize are query-only:** changing the view (wheel, pan) or resizing the window never
+  recomputes stored data. Each redraw computes samples-per-pixel for the visible range and asks
+  the buffer for a decimated slice at that resolution (below); the response is bounded by the
+  pixel width, not the history length.
+
+## Rendering pipeline: ring buffer + min/max pyramid
+
+The history store (`model.RingBuffer`) decouples *storage* from *rendering* so a multi-GiB window
+draws at screen resolution without per-frame work proportional to its size. Two structures, both
+**channel-major** and built for ≤16 simultaneous channels:
+
+- **Raw ring** — a preallocated `(n_channels, capacity)` `float32` array with a wrapping write
+  index. Appends are a single vectorised slice-assign (no per-frame concatenation, the old chunk
+  list's cost); the X axis is *not* stored — it is the integer sample index, regenerated as
+  `float64` on read (`float32` cannot represent sample indices past `2**24`). `float32` halves the
+  footprint versus the decoded `float64`, which matters at large windows; plotting needs only
+  ~7 digits.
+- **Min/max pyramid** — for each level `L ≥ 1`, two `(n_channels, capacity / Fᴸ)` arrays holding
+  the **min and max** of every `Fᴸ` raw samples, with **`F = 8`**. `F = 8` keeps the level count
+  low (one level per three binary octaves) while bounding total pyramid memory to ≈ `1/(F−1) ≈ 14%`
+  of the raw store. The pyramid is itself a set of rings aligned to the raw ring, so coarse buckets
+  age out in lockstep with the raw samples they summarise.
+
+**The pyramid is maintained incrementally, never rebuilt from all data.** On each `append`, the
+new samples are folded up the levels — level 1 from the raw block, level `L` by reducing `F`
+freshly-completed level-`L−1` buckets — touching only the buckets the new block lands in. Cost is
+`O(n_new · n_levels)`, i.e. **amortised O(1) per sample**, independent of how much history already
+exists. Only complete buckets are stored; the in-progress tail bucket is filled in once it
+completes, so a coarse zoom-out can lag the very latest sample by at most one bucket width.
+
+**Reading is `O(visible pixels)`.** `RingBuffer.view(x0, x1, max_points)` clamps the range to the
+resident window, computes `samples_per_pixel = span / max_points`, and picks the coarsest level
+whose bucket spans ≤ one pixel (`L = ⌊log_F(spp)⌋`, clamped). It then slices that level's min/max
+rings over the visible range and returns ~`2 · pixel_width` points. When zoomed in past one
+sample per pixel it returns **exact raw samples** instead. The GUI draws an envelope by emitting
+two points per bucket (min then max) at the bucket's X, so spikes survive decimation; this is the
+agreed trade-off — **every level except the finest shows the min/max envelope, the finest is exact
+samples**. Disabled v2.0 channels are all-NaN and reduce to NaN buckets, which draw as gaps.
+
+`pyqtgraph`'s own auto-downsampling is therefore left off (we pre-decimate), and global
+antialiasing is disabled because the point count is already near the pixel width.
+
+**Changing the history size** (`set_window`) reallocates the ring/pyramid and copies the retained
+**tail back at its original sample indices** so the X axis stays continuous, then rebuilds the
+pyramid over it — an `O(retained)` one-shot on a deliberate user action, not a per-frame cost.
+
+**RAM guard.** `RingBuffer.footprint_bytes(n_channels, window_n)` reports the exact allocation
+(raw + pyramid). Before accepting a new history size the GUI checks it against
+`RAM_BUDGET_FRACTION` (0.8) of free RAM (via `psutil` if present, else `/proc/meminfo`); an
+over-budget choice is logged and rejected (the previous size is kept), and once the real channel
+count is known on connect an over-budget default is clamped down to the largest option that fits.
 
 ## Simulator (`tools/sim.py`)
 

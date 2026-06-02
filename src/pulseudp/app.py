@@ -42,9 +42,66 @@ DEFAULT_PORT = 2102
 REDRAW_HZ = 30
 # The X axis counts samples, not seconds: windows are sample counts.
 DEFAULT_VIEW_N = 500        # initial zoom: samples per screen (wheel-controlled)
-DEFAULT_HISTORY_N = 5000    # initial rolling-history retention (spin-box-controlled)
+DEFAULT_HISTORY_N = 1_000_000   # initial rolling-history retention (combo-controlled)
 MIN_WINDOW_N = 2
-MAX_WINDOW_N = 10_000_000
+MAX_WINDOW_N = 1_000_000_000
+
+# Selectable rolling-history sizes (samples). Retention is picked from this list,
+# not free-typed, because the only meaningful axis is order of magnitude and a
+# big value must be checked against free RAM before it is allocated.
+HISTORY_OPTIONS = [
+    ("1K", 1_000), ("10K", 10_000), ("100K", 100_000), ("1M", 1_000_000),
+    ("10M", 10_000_000), ("100M", 100_000_000), ("1G", 1_000_000_000),
+]
+# Fraction of currently-available RAM a new history buffer may claim.
+RAM_BUDGET_FRACTION = 0.8
+
+
+def _available_ram_bytes() -> Optional[int]:
+    """Best-effort free RAM in bytes; None if it cannot be determined.
+
+    Cross-platform with no required dependency: ``psutil`` if installed, else a
+    per-OS probe (``GlobalMemoryStatusEx`` on Windows, ``/proc/meminfo`` on
+    Linux). Returns None when none apply, which leaves the RAM guard inert rather
+    than guessing.
+    """
+    try:
+        import psutil  # optional dependency
+        return int(psutil.virtual_memory().available)
+    except Exception:  # noqa: BLE001 - psutil missing or failed
+        pass
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            class _MemStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MemStatusEx()
+            stat.dwLength = ctypes.sizeof(stat)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+        except Exception:  # noqa: BLE001 - unexpected ctypes/platform failure
+            pass
+        return None
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024     # kB -> bytes
+    except OSError:
+        pass
+    return None
 
 # Trace colour palette (cycled across all plots).
 _PALETTE = [
@@ -206,14 +263,17 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self._start_btn)
 
         row.addWidget(QtWidgets.QLabel("History (samples):"))
-        self._history_spin = QtWidgets.QSpinBox()
-        self._history_spin.setRange(MIN_WINDOW_N, MAX_WINDOW_N)
-        self._history_spin.setValue(DEFAULT_HISTORY_N)
-        self._history_spin.setToolTip(
-            "How many recent samples to keep (rolling history). "
-            "Independent of the wheel zoom — zooming never discards data.")
-        self._history_spin.valueChanged.connect(self._on_history_changed)
-        row.addWidget(self._history_spin)
+        self._history_combo = QtWidgets.QComboBox()
+        for label, value in HISTORY_OPTIONS:
+            self._history_combo.addItem(label, value)
+        self._history_combo.setCurrentIndex(
+            [v for _, v in HISTORY_OPTIONS].index(DEFAULT_HISTORY_N))
+        self._history_combo.setToolTip(
+            "How many recent samples to keep (rolling history). Independent of "
+            "the wheel zoom — zooming never discards data. A size that would not "
+            "fit in free RAM is rejected.")
+        self._history_combo.currentIndexChanged.connect(self._on_history_changed)
+        row.addWidget(self._history_combo)
 
         row.addStretch(1)
         self._status = QtWidgets.QLabel("Not connected")
@@ -298,9 +358,47 @@ class MainWindow(QtWidgets.QMainWindow):
             client = self._client
             self._run_async(lambda: client.stop_stream(timeout=1.0))
 
-    def _on_history_changed(self, value: int) -> None:
-        # The spin box controls data RETENTION only — never the zoom.
-        self._history_n = int(value)
+    def _channel_count(self) -> Optional[int]:
+        """Channels the buffer holds, or None until a descriptor is known."""
+        return len(self._model.channel_keys) if self._model is not None else None
+
+    def _history_fits(self, window_n: int) -> bool:
+        """True if a ``window_n`` buffer fits the RAM budget.
+
+        Optimistic when the answer cannot be known yet — no descriptor (channel
+        count unknown) or no RAM reading available. The authoritative check runs
+        in :meth:`_on_descriptor` once the real channel count is in hand.
+        """
+        channels = self._channel_count()
+        avail = _available_ram_bytes()
+        if channels is None or avail is None:
+            return True
+        return RingBuffer.footprint_bytes(channels, window_n) <= RAM_BUDGET_FRACTION * avail
+
+    def _select_history_value(self, value: int) -> None:
+        """Reflect an accepted history size in the combo without re-triggering."""
+        idx = next((i for i, (_, v) in enumerate(HISTORY_OPTIONS) if v == value), -1)
+        if idx >= 0:
+            self._history_combo.blockSignals(True)
+            self._history_combo.setCurrentIndex(idx)
+            self._history_combo.blockSignals(False)
+
+    def _on_history_changed(self, index: int) -> None:
+        # The combo controls data RETENTION only — never the zoom.
+        value = int(self._history_combo.itemData(index))
+        if not self._history_fits(value):
+            # _history_fits only rejects when the channel count is known.
+            channels = self._channel_count() or 0
+            need = RingBuffer.footprint_bytes(channels, value)
+            self._append_log(
+                "error",
+                "History {} (~{:.1f} GiB for {} channels) exceeds free RAM; "
+                "keeping {} samples.".format(
+                    self._history_combo.itemText(index), need / 2**30,
+                    channels, self._history_n))
+            self._select_history_value(self._history_n)   # revert to last accepted
+            return
+        self._history_n = value
         if self._ring is not None:
             self._ring.set_window(self._history_n)
 
@@ -308,6 +406,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_descriptor(self, descriptor: Descriptor) -> None:
         self._model = PlotModel(descriptor)
+        # Now that the real channel count is known, the chosen history may no
+        # longer fit; clamp down to the largest option that does.
+        if not self._history_fits(self._history_n):
+            for _, value in reversed(HISTORY_OPTIONS):
+                if value <= self._history_n and self._history_fits(value):
+                    self._append_log(
+                        "info", "History clamped to {} samples to fit free RAM "
+                        "({} channels).".format(value, self._channel_count()))
+                    self._history_n = value
+                    break
+            self._select_history_value(self._history_n)
         self._ring = RingBuffer(self._model.channel_keys, window_n=self._history_n)
         self._n_channels = len(descriptor.fields)
         # Channel selection is a v2.0 feature; in v1.0 the list is immutable.
@@ -555,23 +664,48 @@ class MainWindow(QtWidgets.QMainWindow):
         return QtGui.QIcon(pix)
 
     def _redraw(self) -> None:
-        if self._ring is None or self._model is None:
+        if self._ring is None or self._model is None or self._primary_plot is None:
             return
-        x, chans = self._ring.snapshot()
-        if x.size == 0:
+        latest = self._ring.latest_index()
+        if latest is None:
             return
-        for key, curve in self._curves.items():
-            y = chans.get(key)
-            if y is None or y.size != x.size:
-                continue
-            if key in self._bit_offset:
-                curve.setData(x, y * 0.8 + self._bit_offset[key])
-            else:
-                curve.setData(x, y)
-        if self._running and self._primary_plot is not None:
-            latest = float(x[-1])
-            self._primary_plot.getViewBox().setXRange(
-                latest - self._view_n, latest, padding=0)
+        vb = self._primary_plot.getViewBox()
+        # Pixel width of the plot bounds how many points are worth drawing; the
+        # pyramid decimates to that, so render cost is independent of history size.
+        px = vb.width()
+        px = int(px) if px and px > 1 else 1000
+        if self._running:
+            # Following the latest sample at the current zoom width.
+            x1 = float(latest)
+            x0 = x1 - self._view_n
+        else:
+            (x0, x1), _ = vb.viewRange()
+
+        view = self._ring.view(x0, x1, px)
+        if view is not None and view.x.size:
+            for key, curve in self._curves.items():
+                lo = view.ymin.get(key)
+                if lo is None:
+                    continue
+                if view.exact:
+                    y = lo
+                    if key in self._bit_offset:
+                        y = y * 0.8 + self._bit_offset[key]
+                    curve.setData(view.x, y)
+                else:
+                    # Draw the per-bucket envelope: two points per bucket (min then
+                    # max) at the bucket's X, so spikes survive decimation.
+                    hi = view.ymax[key]
+                    xx = np.repeat(view.x, 2)
+                    yy = np.empty(lo.size * 2, dtype=np.float64)
+                    yy[0::2] = lo
+                    yy[1::2] = hi
+                    if key in self._bit_offset:
+                        yy = yy * 0.8 + self._bit_offset[key]
+                    curve.setData(xx, yy)
+
+        if self._running:
+            vb.setXRange(float(latest) - self._view_n, float(latest), padding=0)
 
     # -- wheel state machine --------------------------------------------------
 
@@ -607,7 +741,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def run() -> int:
     """Launch the GUI. Returns a process exit code."""
-    pg.setConfigOptions(antialias=True)
+    # Antialiasing is costly on dense curves; the pyramid already caps point
+    # counts near the pixel width, so leave it off for smooth high-rate redraws.
+    pg.setConfigOptions(antialias=False)
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()
     win.show()
