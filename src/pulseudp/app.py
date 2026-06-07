@@ -33,6 +33,7 @@ except ImportError as exc:  # pragma: no cover - import-time guard
         "The GUI needs the 'gui' extra: pip install -e .[gui] "
         "(PyQt5 + pyqtgraph + numpy)\n" + str(exc))
 
+from . import __version__
 from .client import LogEvent, UdpClient
 from .discovery import Discovery, NullDiscovery
 from .model import PlotModel, RingBuffer
@@ -160,7 +161,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, host: str = "127.0.0.1",
                  discovery: Optional[Discovery] = None) -> None:
         super().__init__()
-        self.setWindowTitle("pulseUDP client")
+        self.setWindowTitle("pulseUDP client v{}".format(__version__))
         self.resize(1100, 760)
 
         self._schema = _load_schema()
