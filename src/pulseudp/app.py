@@ -283,9 +283,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._history_combo.currentIndexChanged.connect(self._on_history_changed)
         row.addWidget(self._history_combo)
 
-        row.addStretch(1)
-        self._status = QtWidgets.QLabel("Not connected")
-        row.addWidget(self._status)
+        row.addStretch(1)   # keep the controls left-aligned
         return box
 
     def _build_log_dock(self) -> None:
@@ -472,22 +470,34 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_async(work)
 
     def _on_state(self, state: str, detail: str) -> None:
-        label = state.capitalize()
-        if detail:
-            label += " — " + detail
-        self._status.setText(label)
+        # Connection lifecycle is reported through the log. Only states the log
+        # does not already cover are surfaced here — an "error" state is skipped
+        # because the matching raised exception is logged by _on_error, and
+        # "negotiated protocol" is already logged by the client (the "connected"
+        # line adds descriptor/field info).
         if state == "streaming":
             self._running = True
             self._start_btn.setText("Stop")
             self._set_checks_enabled(False)   # can't change channels mid-stream
+            self._append_log("info", "Streaming")
         elif state in ("stopped", "disconnected", "error"):
             self._running = False
             self._start_btn.setText("Start")
             self._set_checks_enabled(True)     # selectable again once stopped
+            if state == "stopped":
+                self._append_log("info", "Stopped")
+            elif state == "disconnected":
+                self._append_log("info", "Disconnected")
+            # "error": already logged via _on_error / the raised exception.
+        elif state == "connecting":
+            self._append_log("info",
+                             "Connecting to {}".format(detail) if detail else "Connecting")
+        elif state == "connected":
+            self._append_log("info",
+                             "Connected — {}".format(detail) if detail else "Connected")
 
     def _on_error(self, message: str) -> None:
         self._append_log("error", message)
-        self._status.setText("Error — " + message)
 
     def _on_log(self, ev: LogEvent) -> None:
         self._append_log(ev.level, "[{}] {}".format(ev.category, ev.message))

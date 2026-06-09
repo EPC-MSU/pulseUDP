@@ -90,8 +90,8 @@ one call; multipliers apply as vectorized float ops. `n_packets = payload_len //
 
 1. **Connection bar (top):** `[Search]` (SSDP probe — see [Discovery](#discovery-search-button))
    → device list ↔ editable IP field (list selection fills it; manual edit allowed) →
-   `[Connect]` (sends `DESCRIPTION`) → status label → `[Start/Stop]` telemetry → rolling-window
-   size selector (samples).
+   `[Connect]` (sends `DESCRIPTION`) → `[Start/Stop]` telemetry → rolling-window
+   size selector (samples). Connection lifecycle and errors are reported in the log dock.
 2. **Telemetry list (left):** one row per field — name, type, a checkbox **checked + disabled**
    (reserved for the future selectable-fields feature, RFC §8), and a color swatch matching
    the curve. Every field is plotted; the X axis is a synthetic sample counter.
