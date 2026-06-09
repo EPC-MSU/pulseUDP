@@ -5,4 +5,4 @@ Ethernet-capable microcontrollers, per the protocol defined in
 ``spec/RFC-pulseUDP.md``.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
