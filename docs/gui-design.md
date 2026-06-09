@@ -54,8 +54,10 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
   `Descriptor` (parse + validate, build decode plan) and the NumPy decoder.
 - `client.py` *(new)* — `UdpClient`: socket lifecycle, `DESCRIPTION`/`TELEMETRY`/`STOP`
   transactions with retransmit timeout, receiver thread, Qt signals for samples + log events.
-- `discovery.py` *(new)* — pluggable `Discovery` interface with a no-op stub backend (Search
-  returns nothing for now; keeps the public RFC discovery-free).
+- `discovery.py` *(new)* — pluggable `Discovery` interface with two backends: `SsdpDiscovery`
+  (the GUI default — an SSDP/UPnP M-SEARCH probe, see [Discovery](#discovery-search-button)) and
+  `NullDiscovery` (finds nothing). SSDP is a separate standard protocol, so this keeps the pulseUDP
+  RFC itself discovery-free.
 - `model.py` *(new)* — `RingBuffer` (sample-counter X, sample-bounded history), channel/units
   grouping.
 - `app.py` *(replaces stub)* — `MainWindow` and panels.
@@ -86,9 +88,10 @@ one call; multipliers apply as vectorized float ops. `n_packets = payload_len //
 
 ## UI layout (single window, stacked panels)
 
-1. **Connection bar (top):** `[Search]` → device list ↔ editable IP field (list selection
-   fills it; manual edit allowed) → `[Connect]` (sends `DESCRIPTION`) → status label →
-   `[Start/Stop]` telemetry → rolling-window size selector (samples).
+1. **Connection bar (top):** `[Search]` (SSDP probe — see [Discovery](#discovery-search-button))
+   → device list ↔ editable IP field (list selection fills it; manual edit allowed) →
+   `[Connect]` (sends `DESCRIPTION`) → `[Start/Stop]` telemetry → rolling-window
+   size selector (samples). Connection lifecycle and errors are reported in the log dock.
 2. **Telemetry list (left):** one row per field — name, type, a checkbox **checked + disabled**
    (reserved for the future selectable-fields feature, RFC §8), and a color swatch matching
    the curve. Every field is plotted; the X axis is a synthetic sample counter.
@@ -156,6 +159,33 @@ pyramid over it — an `O(retained)` one-shot on a deliberate user action, not a
 over-budget choice is logged and rejected (the previous size is kept), and once the real channel
 count is known on connect an over-budget default is clamped down to the largest option that fits.
 
+## Discovery (Search button)
+
+The pulseUDP RFC defines no discovery handshake, so the **Search** button uses a standard,
+RFC-independent mechanism instead: an **SSDP/UPnP M-SEARCH** probe (`discovery.SsdpDiscovery`,
+the GUI default). SSDP only locates a host's IP address; the client then addresses it on the
+telemetry port exactly as if the IP had been typed in, so nothing about the wire protocol changes.
+
+- **Probe.** A `M-SEARCH * HTTP/1.1` datagram (`MAN: "ssdp:discover"`, `MX: 2`, `ST: ssdp:all` —
+  the broadest target) is multicast to `239.255.255.250:1900`. On a **multi-homed host** (common
+  on Windows) the probe is sent on **every IPv4 interface** (enumerated via `ifaddr`, a `gui`-extra
+  dependency), so devices on secondary subnets are not missed; an interface that fails to bind is
+  logged and skipped. The probe is sent twice per interface to ride out UDP loss.
+- **Collect.** `HTTP/1.1 200 OK` replies and `ssdp:alive` `NOTIFY` advertisements are gathered for
+  the search timeout (~3 s, ≥ `MX`); `ssdp:byebye` is ignored. Responders are de-duplicated by
+  their `LOCATION` URL.
+- **Name & filter.** Each unique `LOCATION` is fetched over HTTP and its `<friendlyName>` is read
+  from the UPnP description (namespace-agnostic XML parse, regex fallback). **Only devices that
+  yield a friendly name are listed** — a responder without a readable description is dropped rather
+  than shown as an opaque address. The dropdown shows `name (address)`; selecting one fills the IP
+  field with the address.
+- **Threading.** The probe blocks for a few seconds (multicast wait + per-device HTTP fetches), so
+  `search()` runs on a worker thread; the Search button shows *Searching…* and is disabled until
+  results arrive on the GUI thread via a Qt signal. Discovery progress is mirrored to the log dock.
+
+`NullDiscovery` (finds nothing) remains available for environments with no SSDP responders or
+where multicast is undesirable.
+
 ## Simulator (`tools/sim.py`)
 
 Listens on UDP 2102; answers `DESCRIPTION` with `spec/examples/telemetry_example.json`; on
@@ -171,7 +201,8 @@ ring-buffer trim-by-sample-window, sequence-gap detection. GUI smoke test option
 
 ## Deferred (unchanged by this design)
 
-Real discovery algorithm; selectable telemetry fields (RFC §8).
+Selectable telemetry fields (RFC §8). (Device discovery is now implemented via SSDP — see
+[Discovery](#discovery-search-button).)
 
 The v2.0 wire path is fully implemented: the CRC is validated (CRC-16/CCITT-FALSE, RFC §3.2)
 and large messages split across several datagrams are reassembled length-delimited (RFC §5.6,

@@ -35,7 +35,7 @@ except ImportError as exc:  # pragma: no cover - import-time guard
 
 from . import __version__
 from .client import LogEvent, UdpClient
-from .discovery import Discovery, NullDiscovery
+from .discovery import Discovery, SsdpDiscovery
 from .model import PlotModel, RingBuffer
 from .protocol import Descriptor
 
@@ -131,6 +131,8 @@ class _Bridge(QtCore.QObject):
     state = QtCore.pyqtSignal(str, str)     # (state, detail)
     descriptor = QtCore.pyqtSignal(object)  # Descriptor (on connect)
     channels = QtCore.pyqtSignal(object)    # List[bool] enabled-channel set (v2.0)
+    devices = QtCore.pyqtSignal(object)     # List[Device] from a Search
+    disco_log = QtCore.pyqtSignal(str, str)  # (level, message) discovery progress
     error = QtCore.pyqtSignal(str)
 
 
@@ -165,7 +167,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1100, 760)
 
         self._schema = _load_schema()
-        self._discovery = discovery or NullDiscovery()
+        # SSDP is the GUI default; the Search button probes the LAN for devices.
+        # Discovery logs go through the bridge (search runs off the GUI thread).
+        self._discovery = discovery or SsdpDiscovery(
+            on_log=lambda level, msg: self._bridge.disco_log.emit(level, msg))
         self._client: Optional[UdpClient] = None
         self._model: Optional[PlotModel] = None
         self._ring: Optional[RingBuffer] = None
@@ -198,6 +203,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bridge.state.connect(self._on_state)
         self._bridge.descriptor.connect(self._on_descriptor)
         self._bridge.channels.connect(self._on_channels_result)
+        self._bridge.devices.connect(self._on_devices_result)
+        self._bridge.disco_log.connect(self._append_log)
         self._bridge.error.connect(self._on_error)
 
         self._build_ui()
@@ -245,7 +252,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self._search_btn)
 
         self._device_combo = QtWidgets.QComboBox()
-        self._device_combo.setMinimumWidth(160)
+        self._device_combo.setMinimumWidth(320)
         self._device_combo.currentIndexChanged.connect(self._on_device_selected)
         row.addWidget(self._device_combo)
 
@@ -276,9 +283,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._history_combo.currentIndexChanged.connect(self._on_history_changed)
         row.addWidget(self._history_combo)
 
-        row.addStretch(1)
-        self._status = QtWidgets.QLabel("Not connected")
-        row.addWidget(self._status)
+        row.addStretch(1)   # keep the controls left-aligned
         return box
 
     def _build_log_dock(self) -> None:
@@ -298,14 +303,40 @@ class MainWindow(QtWidgets.QMainWindow):
         threading.Thread(target=fn, daemon=True).start()
 
     def _on_search(self) -> None:
+        # The SSDP probe blocks for a few seconds (multicast wait + HTTP fetches),
+        # so it runs off the GUI thread; results return via the bridge.
+        self._search_btn.setEnabled(False)
+        self._search_btn.setText("Searching…")
+        self._append_log("info", "Searching for devices (SSDP)…")
+        discovery = self._discovery
+
+        def work():
+            try:
+                devices = discovery.search(timeout=3.0)
+                self._bridge.devices.emit(devices)
+            except Exception as exc:  # noqa: BLE001 - surface to the log/UI
+                self._bridge.error.emit("Search failed: " + str(exc))
+                self._bridge.devices.emit([])
+
+        self._run_async(work)
+
+    def _on_devices_result(self, devices) -> None:
+        self._search_btn.setEnabled(True)
+        self._search_btn.setText("Search")
         self._device_combo.clear()
-        devices = self._discovery.search(timeout=1.0)
         if not devices:
-            self._append_log("info", "Search found no devices "
-                             "(no discovery backend configured).")
+            self._append_log("info", "Search found no devices.")
             return
         for d in devices:
-            self._device_combo.addItem(d.name, d.address)
+            # Display name + address; the address is the item data the IP field
+            # is filled from on selection (see _on_device_selected).
+            label = "{} ({})".format(d.name, d.address)
+            self._device_combo.addItem(label, d.address)
+            # Full label as a per-item tooltip so a name truncated by the combo
+            # width is still readable on hover (Qt shows it for the row).
+            self._device_combo.setItemData(
+                self._device_combo.count() - 1, label, QtCore.Qt.ToolTipRole)
+        self._append_log("info", "Search found {} device(s).".format(len(devices)))
 
     def _on_device_selected(self, index: int) -> None:
         addr = self._device_combo.itemData(index)
@@ -439,22 +470,34 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_async(work)
 
     def _on_state(self, state: str, detail: str) -> None:
-        label = state.capitalize()
-        if detail:
-            label += " — " + detail
-        self._status.setText(label)
+        # Connection lifecycle is reported through the log. Only states the log
+        # does not already cover are surfaced here — an "error" state is skipped
+        # because the matching raised exception is logged by _on_error, and
+        # "negotiated protocol" is already logged by the client (the "connected"
+        # line adds descriptor/field info).
         if state == "streaming":
             self._running = True
             self._start_btn.setText("Stop")
             self._set_checks_enabled(False)   # can't change channels mid-stream
+            self._append_log("info", "Streaming")
         elif state in ("stopped", "disconnected", "error"):
             self._running = False
             self._start_btn.setText("Start")
             self._set_checks_enabled(True)     # selectable again once stopped
+            if state == "stopped":
+                self._append_log("info", "Stopped")
+            elif state == "disconnected":
+                self._append_log("info", "Disconnected")
+            # "error": already logged via _on_error / the raised exception.
+        elif state == "connecting":
+            self._append_log("info",
+                             "Connecting to {}".format(detail) if detail else "Connecting")
+        elif state == "connected":
+            self._append_log("info",
+                             "Connected — {}".format(detail) if detail else "Connected")
 
     def _on_error(self, message: str) -> None:
         self._append_log("error", message)
-        self._status.setText("Error — " + message)
 
     def _on_log(self, ev: LogEvent) -> None:
         self._append_log(ev.level, "[{}] {}".format(ev.category, ev.message))
