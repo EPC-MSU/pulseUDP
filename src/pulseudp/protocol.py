@@ -231,6 +231,12 @@ class Descriptor:
         validated against it (draft-07) before parsing.
         """
         if isinstance(data, (bytes, bytearray)):
+            # Wire form (RFC §5.1): NUL-terminated UTF-8, padded to a 32-bit
+            # word boundary. Cut at the first NUL so the terminator and padding
+            # never reach the JSON parser.
+            nul = data.find(b"\x00")
+            if nul != -1:
+                data = data[:nul]
             data = data.decode("utf-8")
         obj = json.loads(data) if isinstance(data, str) else data
 

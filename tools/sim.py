@@ -61,6 +61,15 @@ def _example_descriptor() -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _frame_descriptor(descriptor_json: str) -> bytes:
+    """Wire form of a descriptor (RFC §5.1): a NUL-terminated UTF-8 string padded
+    to a 32-bit word boundary so ``Payload length`` stays word aligned (RFC §3).
+    """
+    raw = descriptor_json.encode("utf-8") + b"\x00"   # NUL terminator
+    pad = (-len(raw)) % WORD_BYTES                     # pad to a whole word
+    return raw + b"\x00" * pad
+
+
 def _encode_value(field, value: float) -> bytes:
     """Serialize one value into its 32-bit-word span (low bytes, little-endian)."""
     t = field.type
@@ -155,7 +164,7 @@ def serve(host: str, port: int, descriptor_json: str, rate: float,
     # (no multi-datagram support), so a descriptor whose reply overflows can't be
     # served — reject it now rather than emit an over-MTU datagram on connect
     # (which fails with OSError on a real interface). In v2.0 send() splits it.
-    descriptor_bytes = descriptor_json.encode("utf-8")
+    descriptor_bytes = _frame_descriptor(descriptor_json)
     desc_reply_bytes = HEADER_SIZE + len(descriptor_bytes) + TRAILER_SIZE
     if version[0] < 2 and desc_reply_bytes > MTU_BUDGET:
         raise SystemExit(

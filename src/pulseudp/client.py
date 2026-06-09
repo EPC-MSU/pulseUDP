@@ -21,8 +21,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .protocol import (HEADER_SIZE, TRAILER_SIZE, Descriptor, Header,
-                       MessageType, crc16_ccitt, decode_channel_bitmap,
+from .protocol import (HEADER_SIZE, TRAILER_SIZE, WORD_BYTES, Descriptor,
+                       Header, MessageType, crc16_ccitt, decode_channel_bitmap,
                        encode_channel_bitmap)
 
 DEFAULT_PORT = 2102
@@ -40,7 +40,7 @@ _REASM_TIMEOUT = 0.3   # s, multi-datagram reassembly deadline (RFC §5.6)
 class LogEvent:
     """A protocol-level event for the log panel. The consumer adds the wall clock."""
 
-    category: str    # bad_magic | bad_version | short | decode | seq_gap | crc | reasm | info | error
+    category: str    # bad_magic | bad_version | short | align | decode | seq_gap | crc | reasm | info | error
     message: str
     level: str = "warning"   # info | warning | error
 
@@ -421,6 +421,17 @@ class UdpClient:
             # Sequence-loss detection runs on the telemetry stream only.
             if header.message_type == MessageType.TELEMETRY:
                 self._check_sequence(header.sequence)
+
+        # RFC §3: Payload length MUST be a whole number of 32-bit words. A
+        # violation is malformed framing; warn but stay tolerant — decode
+        # whatever is well-formed (whole packets for telemetry; the descriptor
+        # parser stops at the first NUL). Checked after the CRC so a corrupt
+        # header's length never triggers a spurious warning.
+        if header.payload_length % WORD_BYTES != 0:
+            self._log("align", "warning",
+                      "payload length {} B is not 32-bit word aligned (RFC §3); "
+                      "message type 0x{:04x} processed tolerantly".format(
+                          header.payload_length, header.message_type))
 
         mtype = header.message_type
         avail = len(data) - HEADER_SIZE - TRAILER_SIZE

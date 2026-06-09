@@ -1,5 +1,6 @@
 """Tests for descriptor decoding and header framing (no Qt, no sockets)."""
 
+import json
 import struct
 
 import numpy as np
@@ -27,6 +28,17 @@ def _pack(ts, va, cur, flags, counter):
             + struct.pack("<hh", cur, 0)
             + struct.pack("<I", flags)
             + struct.pack("<i", counter))
+
+
+def test_from_json_strips_nul_terminator_and_word_padding():
+    # Wire form (RFC §5.1): NUL-terminated UTF-8, padded to a 32-bit word.
+    # Non-zero padding proves the reader stops at the first NUL.
+    body = json.dumps(EXAMPLE).encode("utf-8") + b"\x00"
+    framed = body + b"\xff" * ((-len(body)) % 4)
+    assert len(framed) % 4 == 0                 # word-aligned payload (RFC §3)
+    d = Descriptor.from_json(framed)            # terminator + padding ignored
+    assert [f.name for f in d.fields] == [
+        "Timestamp", "VoltageA", "Current", "Flags", "Counter"]
 
 
 def test_packet_size_and_plot_fields():

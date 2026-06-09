@@ -74,6 +74,26 @@ def test_v01_crc_field_is_ignored():
     assert events == []
 
 
+# -- inbound: payload alignment (RFC §3) --------------------------------------
+
+def test_non_word_aligned_payload_warns_but_is_tolerated():
+    # RFC §3: Payload length MUST be 32-bit word aligned. A violation is
+    # flagged ('align') yet still processed — the client stays tolerant.
+    events = []
+    c = UdpClient("127.0.0.1", version=(2, 0), on_log=lambda e: events.append(e))
+    c._handle_datagram(_datagram(MessageType.STOP, 0, (2, 0), payload=b"abc"))
+    assert c._stop_ack.is_set()                 # processed despite misalignment
+    assert [e.category for e in events] == ["align"]
+
+
+def test_word_aligned_payload_is_silent():
+    events = []
+    c = UdpClient("127.0.0.1", version=(2, 0), on_log=lambda e: events.append(e))
+    c._handle_datagram(_datagram(MessageType.STOP, 0, (2, 0), payload=b"abcd"))
+    assert c._stop_ack.is_set()
+    assert events == []                         # 4 B is word-aligned, no warning
+
+
 # -- inbound: sequence-loss detection -----------------------------------------
 
 def test_v1_telemetry_sequence_gap_logs():

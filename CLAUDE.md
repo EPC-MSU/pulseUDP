@@ -81,9 +81,10 @@ These span multiple sections of the RFC; get them right when editing either side
 - **Single client:** the server serves one client at a time; a command from a new
   source address supersedes the previous client and **resets session state including the
   sequence counter**. Multi-datagram reassembly (RFC §5.6) depends on this.
-- **Descriptors are static in v1.0**, sent as a UTF-8 JSON string with no NUL terminator, and
-  must validate against `spec/Schema.json`. `bitfield` is always a `uint32`; bits map to the
-  `bits[]` names from the LSB up.
+- **Descriptors are static in v1.0**, sent as a NUL-terminated UTF-8 JSON string, padded to a
+  32-bit word boundary (so `Payload length` stays word-aligned per RFC §3; a reader takes the JSON
+  up to the first NUL). They must validate against `spec/Schema.json`. `bitfield` is always a
+  `uint32`; bits map to the `bits[]` names from the LSB up.
 
 ## Open item
 

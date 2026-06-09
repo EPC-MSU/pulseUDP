@@ -135,7 +135,7 @@ transaction).
 
 | Constant | Value (uint16) | Transaction | client → server | server → client |
 |---|---|---|---|---|
-| `DESCRIPTION` | `0x0001` | Get descriptor | request, empty payload | JSON descriptor (see §5), UTF-8, no NUL terminator |
+| `DESCRIPTION` | `0x0001` | Get descriptor | request, empty payload | JSON descriptor (see §5), UTF-8, NUL-terminated and padded to a 32-bit word boundary |
 | `TELEMETRY` | `0x0002` | Telemetry stream | request to start, empty payload | streamed telemetry messages, with one or more packets (see §5.3); in **v2.0** a message MAY span several datagrams (§5.6), until stopped |
 | `STOP` | `0x0003` | Stop stream | request, empty payload | acknowledgement, empty payload (sent once streaming has ceased) |
 | `GET_CHANNELS` | `0x0004` | Read enabled channels (v2.0) | request, empty payload | the channel bitmap (defined below): the currently enabled channels |
@@ -190,7 +190,9 @@ disable everything.
 ### 5.1 The descriptor
 
 The `DESCRIPTION` payload is a JSON object describing telemetry packet capabilities. It is sent as a
-single UTF-8 string with no NUL terminator. Its structure is defined in the Schema.json file.
+single UTF-8 string terminated by one NUL (`0x00`) byte, then padded so the payload length is a
+whole number of 32-bit words (§3). A reader takes the JSON as the bytes up to the first NUL. Its
+structure is defined in the Schema.json file.
 
 The descriptor supports the list of the telemetry values, describing their
 
