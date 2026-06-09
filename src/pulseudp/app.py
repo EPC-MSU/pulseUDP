@@ -159,12 +159,41 @@ class TelemetryViewBox(pg.ViewBox):
         ev.accept()
 
 
+class _DeviceCombo(QtWidgets.QComboBox):
+    """Discovered-device dropdown.
+
+    It prefers a wide box (so device labels rarely truncate) but is the control
+    that gives up width first when the window is narrowed — the Address field
+    beside it keeps a fixed width. This is achieved by a wide preferred size with
+    a small minimum (the box elides the text and the per-item tooltip still shows
+    the full label); a ``Preferred`` policy leaves slack to the trailing stretch
+    rather than growing the box past its preferred width.
+    """
+
+    PREFERRED_W = 320
+    MINIMUM_W = 120
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                           QtWidgets.QSizePolicy.Fixed)
+
+    def sizeHint(self) -> QtCore.QSize:
+        sh = super().sizeHint()
+        sh.setWidth(self.PREFERRED_W)
+        return sh
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        msh = super().minimumSizeHint()
+        msh.setWidth(self.MINIMUM_W)
+        return msh
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, host: str = "127.0.0.1",
                  discovery: Optional[Discovery] = None) -> None:
         super().__init__()
         self.setWindowTitle("pulseUDP client v{}".format(__version__))
-        self.resize(1100, 760)
 
         self._schema = _load_schema()
         # SSDP is the GUI default; the Search button probes the LAN for devices.
@@ -215,12 +244,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- UI construction ------------------------------------------------------
 
+    TREE_W = 280   # initial width of the telemetry list pane
+
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         outer = QtWidgets.QVBoxLayout(central)
 
-        outer.addWidget(self._build_connection_bar())
+        self._conn_box = self._build_connection_bar()
+        outer.addWidget(self._conn_box)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         outer.addWidget(splitter, 1)
@@ -239,9 +271,16 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.addWidget(self._graphs)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([280, 820])
 
         self._build_log_dock()
+
+        # Default window width = the smallest width that shows the connection bar
+        # without shortening any control (the device list is the only one that
+        # gives up width when narrowed further). Height is a comfortable default.
+        m = outer.contentsMargins()
+        width = self._conn_box.sizeHint().width() + m.left() + m.right()
+        self.resize(width, 760)
+        splitter.setSizes([self.TREE_W, max(width - self.TREE_W, 400)])
 
     def _build_connection_bar(self) -> QtWidgets.QWidget:
         box = QtWidgets.QGroupBox("Connection")
@@ -251,14 +290,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._search_btn.clicked.connect(self._on_search)
         row.addWidget(self._search_btn)
 
-        self._device_combo = QtWidgets.QComboBox()
-        self._device_combo.setMinimumWidth(320)
+        self._device_combo = _DeviceCombo()
         self._device_combo.currentIndexChanged.connect(self._on_device_selected)
         row.addWidget(self._device_combo)
 
         row.addWidget(QtWidgets.QLabel("Address:"))
         self._ip_edit = QtWidgets.QLineEdit("127.0.0.1")
-        self._ip_edit.setMaximumWidth(140)
+        self._ip_edit.setFixedWidth(140)   # stays put; the device list yields width instead
         row.addWidget(self._ip_edit)
 
         self._connect_btn = QtWidgets.QPushButton("Connect")
