@@ -252,7 +252,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self._search_btn)
 
         self._device_combo = QtWidgets.QComboBox()
-        self._device_combo.setMinimumWidth(160)
+        self._device_combo.setMinimumWidth(320)
         self._device_combo.currentIndexChanged.connect(self._on_device_selected)
         row.addWidget(self._device_combo)
 
@@ -332,7 +332,12 @@ class MainWindow(QtWidgets.QMainWindow):
         for d in devices:
             # Display name + address; the address is the item data the IP field
             # is filled from on selection (see _on_device_selected).
-            self._device_combo.addItem("{} ({})".format(d.name, d.address), d.address)
+            label = "{} ({})".format(d.name, d.address)
+            self._device_combo.addItem(label, d.address)
+            # Full label as a per-item tooltip so a name truncated by the combo
+            # width is still readable on hover (Qt shows it for the row).
+            self._device_combo.setItemData(
+                self._device_combo.count() - 1, label, QtCore.Qt.ToolTipRole)
         self._append_log("info", "Search found {} device(s).".format(len(devices)))
 
     def _on_device_selected(self, index: int) -> None:
