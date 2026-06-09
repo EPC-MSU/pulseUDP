@@ -23,14 +23,14 @@ the code together.
 - `src/pulseudp/protocol.py` — wire framing/parsing + `Descriptor` (validate JSON, build a NumPy structured-dtype decode plan); mirrors RFC §3 (header) and §5.2 (type widths).
 - `src/pulseudp/client.py` — `UdpClient`: socket + receiver thread, `DESCRIPTION`/`TELEMETRY`/`STOP` transactions; Qt-free (delivers via callbacks).
 - `src/pulseudp/model.py` — `PlotModel` (units grouping) + thread-safe rolling `RingBuffer`.
-- `src/pulseudp/discovery.py` — pluggable `Discovery`; default `NullDiscovery` finds nothing (no discovery protocol in the public RFC).
+- `src/pulseudp/discovery.py` — pluggable `Discovery`; `SsdpDiscovery` (the GUI default) finds devices via a standard SSDP/UPnP M-SEARCH probe, `NullDiscovery` finds nothing. SSDP is a separate standard protocol, so the pulseUDP RFC itself stays discovery-free.
 - `src/pulseudp/app.py`, `__main__.py` — PyQt5 + pyqtgraph GUI. Receiver thread fills the `RingBuffer`; a `QTimer` redraws on the GUI thread. Design in `docs/gui-design.md`.
 - `tools/sim.py` — UDP telemetry simulator (firmware is out of scope); drives the client end to end.
 
 ## Commands
 
 ```sh
-pip install -e .[gui]                  # GUI deps: PyQt5 + pyqtgraph + numpy (PyQt5 is GPLv3)
+pip install -e .[gui]                  # GUI deps: PyQt5 + pyqtgraph + numpy + ifaddr (PyQt5 is GPLv3)
 pip install -e .[dev]                  # package + pytest + numpy (editable, src layout)
 python -m pulseudp                     # launch the GUI client
 python tools/sim.py --rate 1000        # run the simulator (serves the example descriptor on :2102)

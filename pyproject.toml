@@ -35,6 +35,9 @@ gui = [
     "PyQt5>=5.15",
     "pyqtgraph>=0.13",
     "numpy>=1.21",
+    # SSDP discovery (the GUI's Search button) enumerates local interfaces with
+    # ifaddr to probe every subnet on a multi-homed host. See discovery.py.
+    "ifaddr>=0.2",
 ]
 dev = [
     "pytest",

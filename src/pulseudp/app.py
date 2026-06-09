@@ -35,7 +35,7 @@ except ImportError as exc:  # pragma: no cover - import-time guard
 
 from . import __version__
 from .client import LogEvent, UdpClient
-from .discovery import Discovery, NullDiscovery
+from .discovery import Discovery, SsdpDiscovery
 from .model import PlotModel, RingBuffer
 from .protocol import Descriptor
 
@@ -131,6 +131,8 @@ class _Bridge(QtCore.QObject):
     state = QtCore.pyqtSignal(str, str)     # (state, detail)
     descriptor = QtCore.pyqtSignal(object)  # Descriptor (on connect)
     channels = QtCore.pyqtSignal(object)    # List[bool] enabled-channel set (v2.0)
+    devices = QtCore.pyqtSignal(object)     # List[Device] from a Search
+    disco_log = QtCore.pyqtSignal(str, str)  # (level, message) discovery progress
     error = QtCore.pyqtSignal(str)
 
 
@@ -165,7 +167,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1100, 760)
 
         self._schema = _load_schema()
-        self._discovery = discovery or NullDiscovery()
+        # SSDP is the GUI default; the Search button probes the LAN for devices.
+        # Discovery logs go through the bridge (search runs off the GUI thread).
+        self._discovery = discovery or SsdpDiscovery(
+            on_log=lambda level, msg: self._bridge.disco_log.emit(level, msg))
         self._client: Optional[UdpClient] = None
         self._model: Optional[PlotModel] = None
         self._ring: Optional[RingBuffer] = None
@@ -198,6 +203,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bridge.state.connect(self._on_state)
         self._bridge.descriptor.connect(self._on_descriptor)
         self._bridge.channels.connect(self._on_channels_result)
+        self._bridge.devices.connect(self._on_devices_result)
+        self._bridge.disco_log.connect(self._append_log)
         self._bridge.error.connect(self._on_error)
 
         self._build_ui()
@@ -298,14 +305,35 @@ class MainWindow(QtWidgets.QMainWindow):
         threading.Thread(target=fn, daemon=True).start()
 
     def _on_search(self) -> None:
+        # The SSDP probe blocks for a few seconds (multicast wait + HTTP fetches),
+        # so it runs off the GUI thread; results return via the bridge.
+        self._search_btn.setEnabled(False)
+        self._search_btn.setText("Searching…")
+        self._append_log("info", "Searching for devices (SSDP)…")
+        discovery = self._discovery
+
+        def work():
+            try:
+                devices = discovery.search(timeout=3.0)
+                self._bridge.devices.emit(devices)
+            except Exception as exc:  # noqa: BLE001 - surface to the log/UI
+                self._bridge.error.emit("Search failed: " + str(exc))
+                self._bridge.devices.emit([])
+
+        self._run_async(work)
+
+    def _on_devices_result(self, devices) -> None:
+        self._search_btn.setEnabled(True)
+        self._search_btn.setText("Search")
         self._device_combo.clear()
-        devices = self._discovery.search(timeout=1.0)
         if not devices:
-            self._append_log("info", "Search found no devices "
-                             "(no discovery backend configured).")
+            self._append_log("info", "Search found no devices.")
             return
         for d in devices:
-            self._device_combo.addItem(d.name, d.address)
+            # Display name + address; the address is the item data the IP field
+            # is filled from on selection (see _on_device_selected).
+            self._device_combo.addItem("{} ({})".format(d.name, d.address), d.address)
+        self._append_log("info", "Search found {} device(s).".format(len(devices)))
 
     def _on_device_selected(self, index: int) -> None:
         addr = self._device_combo.itemData(index)
