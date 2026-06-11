@@ -92,9 +92,20 @@ one call; multipliers apply as vectorized float ops. `n_packets = payload_len //
    → device list ↔ editable IP field (list selection fills it; manual edit allowed) →
    `[Connect]` (sends `DESCRIPTION`) → `[Start/Stop]` telemetry → rolling-window
    size selector (samples). Connection lifecycle and errors are reported in the log dock.
-2. **Telemetry list (left):** one row per field — name, type, a checkbox **checked + disabled**
-   (reserved for the future selectable-fields feature, RFC §8), and a color swatch matching
-   the curve. Every field is plotted; the X axis is a synthetic sample counter.
+2. **Telemetry list (left):** one row per field — name, type, a checkbox, and a color swatch
+   matching the curve; each bitfield row expands to one child row per bit, each with its own
+   **flag checkbox**. Two distinct mechanisms:
+   - **Field (whole-channel) box.** Under **v2.0** it negotiates the channel with the server
+     (`SET_CHANNELS`, RFC §4; live only while stopped); a disabled channel stops streaming and its
+     plot is dropped. Under **v1.0** the server list is immutable, so it instead **hides the
+     field's curve(s) locally**.
+   - **Flag (per-bit) box.** Always a **local** show/hide of that one bit, in *both* versions — a
+     bitfield is a single channel on the wire, so individual bits are never negotiated. Live
+     whenever its parent channel is streaming.
+
+   Clearing the last visible trace of a plot removes the plot; re-checking brings it back. All
+   local show/hide is allowed even while streaming (the data keeps arriving; only the drawing
+   changes) and **preserves the current pan/zoom**. The X axis is a synthetic sample counter.
 3. **Graph area (center/right):** one `PlotWidget` per units group; one per unitless field;
    one stacked digital plot per bitfield.
 4. **Log dock (bottom, collapsible):** host-time timestamps; categories listed above.

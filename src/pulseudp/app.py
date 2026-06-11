@@ -219,11 +219,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._curves: Dict[str, pg.PlotDataItem] = {}
         self._bit_offset: Dict[str, int] = {}   # bit trace key -> stack row
 
-        # v2.0 channel selection: a checkbox per selectable channel, keyed by its
-        # descriptor field index. Selection is only possible in v2.0 and only while
-        # the stream is stopped (RFC §4); v1.0 keeps the boxes checked and greyed.
-        self._channel_checks: Dict[int, QtWidgets.QCheckBox] = {}
+        # Channel checkboxes drive two different mechanisms depending on the
+        # negotiated version:
+        #   * v2.0 (server negotiation, RFC §4) — a field-level box per channel
+        #     tells the server to start/stop sending it; live only while stopped.
+        #   * v1.0 (local visibility) — the server channel list is immutable, so
+        #     the boxes instead show/hide curves on the graphs client-side. Both
+        #     field-level boxes and per-bit ("flag") boxes are live, even while
+        #     streaming, and removing every trace of a plot removes the plot.
+        # The checkboxes are native tree-item check states (drawn by the item
+        # delegate, so indentation/margins are handled by Qt), keyed by the same
+        # field index / bit trace key as before; the values are the rows themselves.
+        self._channel_checks: Dict[int, QtWidgets.QTreeWidgetItem] = {}  # field idx -> row
+        self._bit_checks: Dict[str, QtWidgets.QTreeWidgetItem] = {}      # bit key -> row
+        self._field_trace_keys: Dict[int, List[str]] = {}  # field index -> its trace keys
+        self._trace_color: Dict[str, str] = {}             # trace key -> fixed colour
+        self._hidden_keys: set = set()  # locally hidden trace keys (both versions)
+        # Server-enabled channel set (v2.0 negotiation); None means "all on", which
+        # is always the case in v1.0. Orthogonal to _hidden_keys (local show/hide).
+        self._enabled_channels: Optional[List[bool]] = None
         self._selectable = False        # True once a v2.0 session is negotiated
+        self._local_filter = False      # True on a v1.0 session (local field hide)
         self._suppress_check = False    # guard against re-entrant checkbox updates
         self._n_channels = 0
 
@@ -246,6 +262,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     TREE_W = 280   # initial width of the telemetry list pane
 
+    # Per-row metadata stored on column 0: what the row's checkbox controls.
+    _ROLE_KIND = QtCore.Qt.UserRole          # "field" | "bit"
+    _ROLE_REF = QtCore.Qt.UserRole + 1       # field index (int) | bit key (str)
+
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -261,8 +281,12 @@ class MainWindow(QtWidgets.QMainWindow):
         tele_layout = QtWidgets.QVBoxLayout(tele_box)
         self._tree = QtWidgets.QTreeWidget()
         self._tree.setHeaderLabels(["", "Name", "Type"])
-        self._tree.setColumnWidth(0, 36)
+        # Column 0 holds the show/hide checkbox as a native item check state, so the
+        # delegate draws it with the correct indentation for nested (bit) rows and
+        # ResizeToContents sizes the column to fit — no manual width/indent math.
+        self._tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         self._tree.setColumnWidth(1, 180)
+        self._tree.itemChanged.connect(self._on_item_changed)
         tele_layout.addWidget(self._tree)
         splitter.addWidget(tele_box)
 
@@ -393,6 +417,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Neutralize channel selection until the new descriptor/version is known
         # (avoids a stale checkbox from the old session pushing SET_CHANNELS).
         self._selectable = False
+        self._local_filter = False
+        self._hidden_keys = set()
+        self._enabled_channels = None
         self._set_checks_enabled(False)
 
         # No version selector: the client probes at v2.0 and adopts whatever
@@ -489,9 +516,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._select_history_value(self._history_n)
         self._ring = RingBuffer(self._model.channel_keys, window_n=self._history_n)
         self._n_channels = len(descriptor.fields)
-        # Channel selection is a v2.0 feature; in v1.0 the list is immutable.
-        self._selectable = (self._client is not None
-                            and self._client.version[0] >= 2)
+        # Server-side channel negotiation is a v2.0 feature; in v1.0 the list is
+        # immutable on the wire, so the boxes drive local show/hide instead.
+        v2 = (self._client is not None and self._client.version[0] >= 2)
+        self._selectable = v2
+        self._local_filter = not v2
+        self._hidden_keys = set()
+        self._enabled_channels = None   # server set arrives via get_channels (v2.0)
         self._build_plots(descriptor)
         self._start_btn.setEnabled(True)
         # v2.0: read the server's current enabled set and reflect it (RFC §4).
@@ -558,24 +589,137 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- plot building & redraw -----------------------------------------------
 
     def _build_plots(self, descriptor: Descriptor) -> None:
-        self._graphs.clear()
+        """Build the channel tree (once) and render the plots for it.
+
+        The tree carries every channel and its checkbox and is built once per
+        connection; the plot area is (re)rendered from the currently-visible
+        trace subset, so a v1.0 local show/hide only re-renders the plots.
+        """
+        self._build_channel_tree(descriptor)
+        self._render_plots()
+
+    def _build_channel_tree(self, descriptor: Descriptor) -> None:
+        """Populate the telemetry tree: one top-level row per field, plus a child
+        row per bit of each bitfield, each with a show/hide checkbox.
+
+        Trace colours are fixed here (``_trace_color``) so they stay stable in the
+        swatches and the curves no matter which subset is currently rendered.
+        """
+        # Setting check states / flags / icons emits itemChanged; suppress so the
+        # build does not fire the toggle handlers.
+        prev_suppress = self._suppress_check
+        self._suppress_check = True
+        try:
+            self._build_channel_tree_rows(descriptor)
+        finally:
+            self._suppress_check = prev_suppress
+
+    def _build_channel_tree_rows(self, descriptor: Descriptor) -> None:
         self._tree.clear()
+        self._channel_checks = {}
+        self._bit_checks = {}
+        self._field_trace_keys = {}
+        self._trace_color = {}
+        color_i = 0
+        # Field name -> descriptor index (= channel index in the bitmap, RFC §4).
+        index_by_name = {f.name: i for i, f in enumerate(descriptor.fields)}
+        field_by_name = {f.name: f for f in descriptor.fields}
+
+        for group in self._model.groups:
+            if group.kind == "bitfield":
+                fi = index_by_name.get(group.title)
+                fld = field_by_name.get(group.title)
+                bit_keys = []
+                for tr in group.traces:
+                    self._trace_color[tr.key] = _PALETTE[color_i % len(_PALETTE)]
+                    color_i += 1
+                    bit_keys.append(tr.key)
+                if fi is not None:
+                    self._field_trace_keys[fi] = bit_keys
+                parent = self._add_field_row(
+                    group.title, fld.type if fld else "bitfield", None, fi)
+                for tr in group.traces:
+                    child = QtWidgets.QTreeWidgetItem(["", tr.label, "bit"])
+                    child.setIcon(1, self._swatch(self._trace_color[tr.key]))
+                    parent.addChild(child)
+                    self._add_bit_check(child, tr.key)
+                parent.setExpanded(False)
+            else:
+                for tr in group.traces:
+                    color = _PALETTE[color_i % len(_PALETTE)]
+                    color_i += 1
+                    self._trace_color[tr.key] = color
+                    fi = index_by_name.get(tr.key)
+                    if fi is not None:
+                        self._field_trace_keys[fi] = [tr.key]
+                    fld = field_by_name.get(tr.key)
+                    self._add_field_row(tr.label, fld.type if fld else "", color, fi)
+
+        self._tree.expandToDepth(0)
+        self._sync_bit_enables()   # flags follow their parent channel (both versions)
+
+    def _channel_on(self, field_index: Optional[int]) -> bool:
+        """Whether a descriptor channel is currently streaming data.
+
+        True for every channel in v1.0 (and in v2.0 until the server's enabled set
+        is known); in v2.0 it reflects the server-negotiated set. A channel that is
+        off carries only NaN, so a plot fed solely by off channels is dropped.
+        """
+        enabled = self._enabled_channels
+        if enabled is None or field_index is None:
+            return True
+        return field_index < len(enabled) and bool(enabled[field_index])
+
+    def _render_plots(self, preserve_view: bool = True) -> None:
+        """(Re)build the plot widgets for the currently-drawable traces.
+
+        A trace is drawn unless it is locally hidden (``_hidden_keys`` — a field or
+        flag checkbox the user unchecked). A plot is omitted when it has no drawable
+        trace, or (v2.0) when every drawable trace's channel is disabled on the
+        server, so hiding the last channel/flag of a group removes its graph.
+
+        ``preserve_view`` keeps the current X pan/zoom across the rebuild (the new
+        ViewBoxes would otherwise reset to defaults); it is the common case, since
+        toggling a checkbox should not jump the view. Cheap enough to call on every
+        toggle — a user action, not a per-frame cost.
+        """
+        if self._model is None:
+            return
+        # Capture the shared X range before tearing the old ViewBoxes down.
+        saved_x = None
+        if preserve_view and self._primary_plot is not None:
+            try:
+                saved_x = self._primary_plot.getViewBox().viewRange()[0]
+            except Exception:  # noqa: BLE001 - plot already gone
+                saved_x = None
+
+        self._graphs.clear()
         self._plots = []
         self._group_fields = []   # parallel to _plots: channel indices feeding each
         self._curves = {}
         self._bit_offset = {}
-        self._channel_checks = {}
         self._link_vb = None
-        color_i = 0
         # Field name -> descriptor index (= channel index in the bitmap, RFC §4).
-        index_by_name = {f.name: i for i, f in enumerate(descriptor.fields)}
+        index_by_name = {f.name: i for i, f in enumerate(self._model.descriptor.fields)}
 
-        # Telemetry tree: one row per field.
-        field_by_name = {f.name: f for f in descriptor.fields}
         row = 0
-        for gi, group in enumerate(self._model.groups):
+        for group in self._model.groups:
+            visible = [tr for tr in group.traces if tr.key not in self._hidden_keys]
+            if not visible:
+                continue   # every channel/flag of this group hidden locally
+            # Descriptor channels feeding this plot: a bitfield plot is fed by its
+            # one field; a numeric plot by each of its traces' fields.
+            if group.kind == "bitfield":
+                gfis = [index_by_name.get(group.title)]
+            else:
+                gfis = [index_by_name.get(tr.key) for tr in visible]
+            gfis = [i for i in gfis if i is not None]
+            if not any(self._channel_on(i) for i in gfis):
+                continue   # v2.0: all feeding channels disabled on the server
+
             plot = self._graphs.addPlot(
-                row=gi, col=0, viewBox=TelemetryViewBox(self))
+                row=row, col=0, viewBox=TelemetryViewBox(self))
+            row += 1
             plot.showGrid(x=True, y=True, alpha=0.3)
             plot.setLabel("bottom", "sample")
             if group.units:
@@ -591,153 +735,230 @@ class MainWindow(QtWidgets.QMainWindow):
             vb.setAutoVisible(y=True)
             vb.enableAutoRange(x=False, y=True)
             self._plots.append(plot)
-            # Descriptor channels feeding this plot (for show/hide on selection):
-            # a bitfield plot is fed by its one field; a numeric plot by each of
-            # its traces' fields.
-            if group.kind == "bitfield":
-                gfis = [index_by_name.get(group.title)]
-            else:
-                gfis = [index_by_name.get(tr.key) for tr in group.traces]
-            self._group_fields.append([i for i in gfis if i is not None])
+            self._group_fields.append(gfis)
 
             if group.kind == "bitfield":
-                # Stack bits on integer rows; label the y axis with bit names.
+                # Stack visible bits on integer rows; label the y axis with names.
                 ticks = []
-                for bi, tr in enumerate(group.traces):
-                    color = _PALETTE[color_i % len(_PALETTE)]
-                    color_i += 1
+                for bi, tr in enumerate(visible):
                     self._bit_offset[tr.key] = bi
-                    curve = plot.plot(pen=pg.mkPen(color, width=2), name=tr.label)
+                    curve = plot.plot(
+                        pen=pg.mkPen(self._trace_color[tr.key], width=2),
+                        name=tr.label)
                     self._curves[tr.key] = curve
                     ticks.append((bi, tr.label))
                 plot.getAxis("left").setTicks([ticks])
                 vb.enableAutoRange(x=False, y=False)
-                vb.setYRange(-0.5, max(1, len(group.traces)) - 0.5 + 0.8)
-                # Tree: bitfield field with its bits as children.
-                fld = field_by_name.get(group.title)
-                parent = self._add_field_row(group.title,
-                                             fld.type if fld else "bitfield", None,
-                                             index_by_name.get(group.title))
-                for bi, tr in enumerate(group.traces):
-                    child = QtWidgets.QTreeWidgetItem(["", tr.label, "bit"])
-                    child.setIcon(1, self._swatch(_PALETTE[
-                        (color_i - len(group.traces) + bi) % len(_PALETTE)]))
-                    parent.addChild(child)
-                parent.setExpanded(False)
+                vb.setYRange(-0.5, max(1, len(visible)) - 0.5 + 0.8)
             else:
-                for tr in group.traces:
-                    color = _PALETTE[color_i % len(_PALETTE)]
-                    color_i += 1
-                    curve = plot.plot(pen=pg.mkPen(color, width=2), name=tr.label)
+                for tr in visible:
+                    curve = plot.plot(
+                        pen=pg.mkPen(self._trace_color[tr.key], width=2),
+                        name=tr.label)
                     self._curves[tr.key] = curve
-                    fld = field_by_name.get(tr.key)
-                    self._add_field_row(tr.label, fld.type if fld else "", color,
-                                        index_by_name.get(tr.key))
 
-        self._tree.expandToDepth(0)
-        # All groups visible initially; channel selection narrows this (v2.0).
+        # Everything built here is currently laid out; the X-axis follows the first.
         self._visible_plots = list(self._plots)
         self._primary_plot = self._plots[0] if self._plots else None
+        # Restore the pre-rebuild pan/zoom (running redraw re-anchors next frame).
+        if saved_x is not None and self._primary_plot is not None:
+            self._primary_plot.getViewBox().setXRange(*saved_x, padding=0)
 
     def _add_field_row(self, name: str, type_str: str, color: Optional[str],
                        field_index: Optional[int]) -> QtWidgets.QTreeWidgetItem:
-        """Add a top-level field row with its channel-enable checkbox.
+        """Add a top-level field row with its channel checkbox.
 
-        The checkbox is live only in v2.0 and only while the stream is stopped
-        (RFC §4 channel selection); in v1.0 it stays checked and greyed because
-        the channel list is immutable.
+        In v2.0 the box negotiates the channel with the server (live only while
+        stopped, RFC §4); in v1.0 it shows/hides the field's curve(s) locally
+        (live always, even while streaming).
         """
         item = QtWidgets.QTreeWidgetItem(["", name, type_str])
         if color:
             item.setIcon(1, self._swatch(color))
         self._tree.addTopLevelItem(item)
-        check = QtWidgets.QCheckBox()
-        check.setChecked(True)
-        check.setEnabled(self._selectable and not self._running)
-        check.setToolTip(
-            "Enable/disable this channel (stop the stream to change)"
-            if self._selectable else
-            "Channel selection is a v2.0 feature; v1.0 channels are fixed")
-        check.stateChanged.connect(self._on_channel_toggled)
-        self._tree.setItemWidget(item, 0, check)
+        item.setData(0, self._ROLE_KIND, "field")
+        item.setData(0, self._ROLE_REF, field_index)
+        item.setToolTip(0, self._field_check_tip())
+        self._set_checkable(item, checked=True, enabled=self._field_check_enabled())
         if field_index is not None:
-            self._channel_checks[field_index] = check
+            self._channel_checks[field_index] = item
         return item
 
-    # -- channel selection (v2.0, RFC §4) -------------------------------------
+    def _add_bit_check(self, item: QtWidgets.QTreeWidgetItem, key: str) -> None:
+        """Make a bitfield child row a per-bit ("flag") show/hide checkbox.
+
+        Flags are always hidden locally — in both versions — because a bitfield is
+        a single channel on the wire, so individual bits are never negotiated with
+        the server. The box is live whenever its parent channel is streaming.
+        """
+        item.setData(0, self._ROLE_KIND, "bit")
+        item.setData(0, self._ROLE_REF, key)
+        item.setToolTip(0, "Show/hide this flag on the graph (local; not sent to the server)")
+        self._set_checkable(item, checked=True, enabled=self._client is not None)
+        self._bit_checks[key] = item
+
+    # -- native check-state helpers -------------------------------------------
+
+    @staticmethod
+    def _checked(item: QtWidgets.QTreeWidgetItem) -> bool:
+        return item.checkState(0) == QtCore.Qt.Checked
+
+    def _set_checkable(self, item: QtWidgets.QTreeWidgetItem,
+                       checked: Optional[bool] = None,
+                       enabled: Optional[bool] = None) -> None:
+        """Set a row's checkbox state/interactivity via native item flags.
+
+        Disabling clears ``ItemIsEnabled`` (the row greys out and the box stops
+        accepting clicks) rather than removing the box. Mutations emit
+        ``itemChanged``; callers run under ``_suppress_check`` so the handler
+        ignores programmatic changes.
+        """
+        flags = item.flags() | QtCore.Qt.ItemIsUserCheckable
+        if enabled is not None:
+            flags = (flags | QtCore.Qt.ItemIsEnabled if enabled
+                     else flags & ~QtCore.Qt.ItemIsEnabled)
+        item.setFlags(flags)
+        if checked is not None:
+            item.setCheckState(0, QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+
+    # -- channel selection (v2.0 negotiation / v1.0 local show-hide) -----------
+
+    def _field_check_enabled(self) -> bool:
+        """Whether field checkboxes are interactive in the current session."""
+        if self._selectable:        # v2.0: only while stopped (server round trip)
+            return not self._running
+        return self._local_filter   # v1.0: always (purely local)
+
+    def _field_check_tip(self) -> str:
+        if self._selectable:
+            return "Enable/disable this channel (stop the stream to change)"
+        if self._local_filter:
+            return "Show/hide this channel on the graphs"
+        return "Channel selection is available after connecting"
 
     def _set_checks_enabled(self, on: bool) -> None:
-        """Enable/disable every channel checkbox (no-op unless v2.0)."""
-        enabled = bool(on) and self._selectable
-        for chk in self._channel_checks.values():
-            chk.setEnabled(enabled)
+        """Reflect interactivity of the checkboxes.
 
-    def _on_channel_toggled(self, _state: int = 0) -> None:
-        """A channel checkbox changed: push the new selection with SET_CHANNELS."""
-        if (self._suppress_check or not self._selectable or self._running
-                or self._client is None):
+        ``on`` carries the v2.0 stopped/running gate for the field boxes; v1.0
+        field boxes ignore it (local hide is allowed even mid-stream). Flag boxes
+        are always local, so they follow only their parent channel's state.
+        """
+        prev = self._suppress_check
+        self._suppress_check = True         # flag mutations re-emit itemChanged
+        try:
+            field_on = bool(on) if self._selectable else self._local_filter
+            for item in self._channel_checks.values():
+                self._set_checkable(item, enabled=field_on)
+            self._sync_bit_enables()
+        finally:
+            self._suppress_check = prev
+
+    def _sync_bit_enables(self) -> None:
+        """A flag box is live whenever connected and its parent channel is shown.
+
+        Parent "shown" = its field box checked: in v1.0 that means not locally
+        hidden, in v2.0 it tracks the server-enabled set (a disabled channel sends
+        no data, so hiding its flags is moot).
+        """
+        prev = self._suppress_check
+        self._suppress_check = True
+        try:
+            connected = self._client is not None
+            for fi, keys in self._field_trace_keys.items():
+                parent = self._channel_checks.get(fi)
+                parent_on = self._checked(parent) if parent is not None else True
+                for key in keys:
+                    item = self._bit_checks.get(key)
+                    if item is not None:
+                        self._set_checkable(item, enabled=connected and parent_on)
+        finally:
+            self._suppress_check = prev
+
+    def _recompute_hidden(self) -> None:
+        """Rebuild the locally-hidden trace set from the checkbox states.
+
+        A flag is hidden whenever its own box is unchecked (both versions). A field
+        is hidden by its box only in v1.0; in v2.0 the field box drives server
+        negotiation (reflected via ``_enabled_channels``), not a local hide.
+        """
+        hidden: set = set()
+        if self._local_filter:
+            for fi, item in self._channel_checks.items():
+                if not self._checked(item):
+                    hidden.update(self._field_trace_keys.get(fi, []))
+        for key, item in self._bit_checks.items():
+            if not self._checked(item):
+                hidden.add(key)
+        self._hidden_keys = hidden
+
+    def _on_item_changed(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
+        """A tree row changed: route a user check-state toggle to its handler.
+
+        ``itemChanged`` also fires for programmatic state/flag changes, which run
+        under ``_suppress_check``; those are ignored here.
+        """
+        if self._suppress_check or column != 0:
             return
-        desired = [True] * self._n_channels
-        for idx, chk in self._channel_checks.items():
-            desired[idx] = chk.isChecked()
-        self._set_checks_enabled(False)      # lock the boxes during the round trip
-        client = self._client
+        kind = item.data(0, self._ROLE_KIND)
+        if kind == "field":
+            self._on_field_toggled()
+        elif kind == "bit":
+            self._on_bit_toggled()
 
-        def work():
-            try:
-                accepted = client.set_channels(desired, timeout=1.0, retries=3)
-                self._bridge.channels.emit(accepted)
-            except Exception as exc:  # noqa: BLE001
-                self._bridge.error.emit(str(exc))
+    def _on_field_toggled(self) -> None:
+        """A field (whole-channel) checkbox changed.
 
-        self._run_async(work)
+        v2.0: push the new field selection to the server with SET_CHANNELS.
+        v1.0: recompute the locally-hidden set and re-render the plots.
+        """
+        if self._selectable:
+            if self._running or self._client is None:
+                return
+            desired = [True] * self._n_channels
+            for idx, item in self._channel_checks.items():
+                desired[idx] = self._checked(item)
+            self._set_checks_enabled(False)  # lock the boxes during the round trip
+            client = self._client
+
+            def work():
+                try:
+                    accepted = client.set_channels(desired, timeout=1.0, retries=3)
+                    self._bridge.channels.emit(accepted)
+                except Exception as exc:  # noqa: BLE001
+                    self._bridge.error.emit(str(exc))
+
+            self._run_async(work)
+        elif self._local_filter:
+            self._recompute_hidden()
+            self._sync_bit_enables()    # a hidden field greys out its flag boxes
+            self._render_plots()
+
+    def _on_bit_toggled(self) -> None:
+        """A per-bit ("flag") checkbox changed: hide/show that bit locally.
+
+        Always local in both versions — the bit is never negotiated with the
+        server — so it only recomputes the hidden set and re-renders the plots.
+        """
+        self._recompute_hidden()
+        self._render_plots()
 
     def _on_channels_result(self, enabled) -> None:
-        """Reflect the server's authoritative enabled set in the checkboxes."""
+        """Reflect the server's authoritative enabled set (v2.0) and re-render."""
+        self._enabled_channels = list(enabled)
         self._suppress_check = True         # programmatic update: don't re-emit
         try:
-            for idx, chk in self._channel_checks.items():
-                chk.setChecked(bool(idx < len(enabled) and enabled[idx]))
+            for idx, item in self._channel_checks.items():
+                item.setCheckState(0, QtCore.Qt.Checked
+                                   if idx < len(enabled) and enabled[idx]
+                                   else QtCore.Qt.Unchecked)
         finally:
             self._suppress_check = False
         if self._ring is not None:
             self._ring.clear()              # packet layout changed; drop stale data
-        self._relayout_plots(enabled)       # hide plots of disabled channels
+        # Channel set (and so packet layout) changed and the buffer was cleared;
+        # start the view fresh rather than preserving a now-empty range.
+        self._render_plots(preserve_view=False)
         self._set_checks_enabled(not self._running)
-
-    def _relayout_plots(self, enabled) -> None:
-        """Show only plots with an enabled channel; reflow them to fill the space.
-
-        Disabled channels (v2.0) carry no data, so their plots are pulled out of
-        the graphics layout and the rest pack upward. The full channel list stays
-        in the tree, so any channel can be re-enabled. The X-axis follows the
-        first visible plot.
-        """
-        if not self._plots:
-            return
-        n = len(enabled)
-
-        def visible(gi: int) -> bool:
-            fis = self._group_fields[gi]
-            return any(i < n and enabled[i] for i in fis) if fis else True
-
-        shown = [self._plots[gi] for gi in range(len(self._plots)) if visible(gi)]
-        # Remove every plot, then re-add the visible ones so rows pack with no gaps.
-        for plot in self._plots:
-            try:
-                self._graphs.removeItem(plot)
-            except Exception:  # noqa: BLE001 - already out of the layout
-                pass
-        self._visible_plots = []
-        self._primary_plot = None
-        for r, plot in enumerate(shown):
-            self._graphs.addItem(plot, row=r, col=0)
-            if self._primary_plot is None:
-                self._primary_plot = plot
-                plot.setXLink(None)              # primary anchors the X axis
-            else:
-                plot.setXLink(self._primary_plot)
-            self._visible_plots.append(plot)
 
     @staticmethod
     def _swatch(color: str) -> QtGui.QIcon:
