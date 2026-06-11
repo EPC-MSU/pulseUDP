@@ -152,11 +152,13 @@ class TelemetryViewBox(pg.ViewBox):
     def getMenu(self, ev):
         # Strip the default ViewBox context menu (axis range, mouse mode, axis
         # linking): navigation here is owned by the wheel state machine and the
-        # Start/Stop follow logic, so those entries only fight the app. Returning
-        # an (empty) menu rather than None keeps raiseContextMenu alive so the
-        # scene still appends its "Export…" action — the one item worth keeping.
+        # Start/Stop follow logic, so those entries only fight the app. The menu
+        # carries just our "Export all…" item; raiseContextMenu then appends the
+        # scene's built-in exporter (renamed "qtgraph export…" in MainWindow).
         if self._menu is None:
             self._menu = QtWidgets.QMenu()
+            act = self._menu.addAction("Export all…")
+            act.triggered.connect(self._win.export_all_csv)
         return self._menu
 
     def wheelEvent(self, ev, axis=None):
@@ -303,6 +305,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._graphs = pg.GraphicsLayoutWidget()
         self._graphs.setBackground("w")
+        # Rename pyqtgraph's built-in scene exporter (the only default menu item
+        # kept, see TelemetryViewBox.getMenu) so it reads as the library's own,
+        # distinct from our "Export all…" CSV dump beside it.
+        for act in self._graphs.scene().contextMenu:
+            if act.text().startswith("Export"):
+                act.setText("qtgraph export…")
         splitter.addWidget(self._graphs)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -1041,6 +1049,48 @@ class MainWindow(QtWidgets.QMainWindow):
             nx1 = x + (x1 - x) * factor
             vb.setXRange(nx0, nx1, padding=0)
         # Running: _redraw() keeps following the latest sample at the new width.
+
+    # -- CSV export -----------------------------------------------------------
+
+    def export_all_csv(self) -> None:
+        """Save every visible trace's full retained history to a CSV file.
+
+        "Visible" = the traces currently drawn (locally hidden channels/flags and
+        v2.0 server-disabled channels are excluded); "all" = the entire rolling
+        window the RingBuffer still holds, not just the on-screen X range — the
+        "qtgraph export…" item already covers the current image. The file is
+        tab-delimited with a header row (a synthetic ``sample`` index column plus
+        one column per trace, named by its key) and values at 5 significant
+        digits. The write runs off the GUI thread; the result is logged.
+        """
+        if self._ring is None or not self._curves:
+            self._append_log("info", "Nothing to export yet.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export all visible data", "pulseudp_export.csv",
+            "CSV files (*.csv);;All files (*)")
+        if not path:
+            return
+        ring = self._ring
+        keys = list(self._curves.keys())   # plot/column order; only drawn traces
+
+        def work():
+            try:
+                x, chans = ring.snapshot()
+                data = np.column_stack([x] + [chans[k] for k in keys])
+                # sample index as a plain integer; values at 5 significant digits.
+                fmt = ["%d"] + ["%.5g"] * len(keys)
+                np.savetxt(path, data, fmt=fmt, delimiter="\t",
+                           header="\t".join(["sample"] + keys), comments="")
+                self._bridge.log.emit(LogEvent(
+                    "export",
+                    "Exported {} samples × {} channel(s) to {}".format(
+                        data.shape[0], len(keys), path),
+                    "info"))
+            except Exception as exc:  # noqa: BLE001 - surface to the log/UI
+                self._bridge.error.emit("Export failed: " + str(exc))
+
+        self._run_async(work)
 
     # -- teardown -------------------------------------------------------------
 
