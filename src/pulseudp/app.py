@@ -147,6 +147,17 @@ class TelemetryViewBox(pg.ViewBox):
     def __init__(self, window: "MainWindow", **kwargs) -> None:
         super().__init__(**kwargs)
         self._win = window
+        self._menu = None   # empty stand-in for the stripped ViewBox menu
+
+    def getMenu(self, ev):
+        # Strip the default ViewBox context menu (axis range, mouse mode, axis
+        # linking): navigation here is owned by the wheel state machine and the
+        # Start/Stop follow logic, so those entries only fight the app. Returning
+        # an (empty) menu rather than None keeps raiseContextMenu alive so the
+        # scene still appends its "Export…" action — the one item worth keeping.
+        if self._menu is None:
+            self._menu = QtWidgets.QMenu()
+        return self._menu
 
     def wheelEvent(self, ev, axis=None):
         delta = ev.delta() if hasattr(ev, "delta") else ev.angleDelta().y()
@@ -720,6 +731,11 @@ class MainWindow(QtWidgets.QMainWindow):
             plot = self._graphs.addPlot(
                 row=row, col=0, viewBox=TelemetryViewBox(self))
             row += 1
+            # Drop the PlotItem ctrl menu (Transforms/Downsample/Average/Alpha/
+            # Grid/Points) — decimation is owned by the min/max pyramid and the
+            # transforms are meaningless on its envelope. The ViewBox menu is
+            # stripped in TelemetryViewBox; together this leaves only "Export…".
+            plot.setMenuEnabled(False, None)
             plot.showGrid(x=True, y=True, alpha=0.3)
             plot.setLabel("bottom", "sample")
             if group.units:
