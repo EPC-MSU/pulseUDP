@@ -38,6 +38,8 @@ gui = [
     # SSDP discovery (the GUI's Search button) enumerates local interfaces with
     # ifaddr to probe every subnet on a multi-homed host. See discovery.py.
     "ifaddr>=0.2",
+    # Free-RAM reading for the history-size guard (app._available_ram_bytes).
+    "psutil>=5",
 ]
 dev = [
     "pytest",

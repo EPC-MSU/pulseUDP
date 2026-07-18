@@ -114,10 +114,11 @@ one call; multipliers apply as vectorized float ops. `n_packets = payload_len //
 
 - **X base:** a synthetic per-sample counter (sample index since the buffer was last cleared).
 - **Running:** X window width `W` (default **500 samples**); the view auto-scrolls so the right
-  edge tracks the latest sample. Wheel: `W ×= 0.5 / ×2` (clamped), still following latest. Y
-  autoscales to the visible window.
-- **Stopped:** free pan; wheel zooms in **×2 steps anchored at the mouse pointer** (custom
-  `wheelEvent` overriding pyqtgraph's continuous zoom). No auto-follow.
+  edge tracks the latest sample. The wheel uses pyqtgraph's native X-only zoom to change `W`,
+  still following latest. Y autoscales to the visible window.
+- **Stopped:** pyqtgraph's native pan/zoom (wheel zooms about the pointer, drag pans), X only.
+  No auto-follow. Both states set `setMouseEnabled(x=True, y=False)` so the wheel never rescales
+  the autoscaled Y axis.
 - **Zoom/resize are query-only:** changing the view (wheel, pan) or resizing the window never
   recomputes stored data. Each redraw computes samples-per-pixel for the visible range and asks
   the buffer for a decimated slice at that resolution (below); the response is bounded by the
@@ -166,7 +167,7 @@ pyramid over it — an `O(retained)` one-shot on a deliberate user action, not a
 
 **RAM guard.** `RingBuffer.footprint_bytes(n_channels, window_n)` reports the exact allocation
 (raw + pyramid). Before accepting a new history size the GUI checks it against
-`RAM_BUDGET_FRACTION` (0.8) of free RAM (via `psutil` if present, else `/proc/meminfo`); an
+`RAM_BUDGET_FRACTION` (0.8) of free RAM (read with `psutil`, in the `gui` extra); an
 over-budget choice is logged and rejected (the previous size is kept), and once the real channel
 count is known on connect an over-budget default is clamped down to the largest option that fits.
 
