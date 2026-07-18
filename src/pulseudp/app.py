@@ -42,10 +42,8 @@ from .protocol import Descriptor
 DEFAULT_PORT = 2102
 REDRAW_HZ = 30
 # The X axis counts samples, not seconds: windows are sample counts.
-DEFAULT_VIEW_N = 500        # initial zoom: samples per screen (wheel-controlled)
+DEFAULT_VIEW_N = 500        # initial view width: samples per screen
 DEFAULT_HISTORY_N = 1_000_000   # initial rolling-history retention (combo-controlled)
-MIN_WINDOW_N = 2
-MAX_WINDOW_N = 1_000_000_000
 
 # Selectable rolling-history sizes (samples). Retention is picked from this list,
 # not free-typed, because the only meaningful axis is order of magnitude and a
@@ -59,50 +57,17 @@ RAM_BUDGET_FRACTION = 0.8
 
 
 def _available_ram_bytes() -> Optional[int]:
-    """Best-effort free RAM in bytes; None if it cannot be determined.
+    """Best-effort free RAM in bytes; None if psutil cannot read it.
 
-    Cross-platform with no required dependency: ``psutil`` if installed, else a
-    per-OS probe (``GlobalMemoryStatusEx`` on Windows, ``/proc/meminfo`` on
-    Linux). Returns None when none apply, which leaves the RAM guard inert rather
-    than guessing.
+    ``psutil`` ships in the ``gui`` extra alongside PyQt5/pyqtgraph/numpy; the
+    None fallback leaves the RAM guard inert rather than guessing if it is
+    somehow unavailable.
     """
     try:
-        import psutil  # optional dependency
+        import psutil
         return int(psutil.virtual_memory().available)
     except Exception:  # noqa: BLE001 - psutil missing or failed
-        pass
-    if sys.platform.startswith("win"):
-        try:
-            import ctypes
-
-            class _MemStatusEx(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            stat = _MemStatusEx()
-            stat.dwLength = ctypes.sizeof(stat)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-                return int(stat.ullAvailPhys)
-        except Exception:  # noqa: BLE001 - unexpected ctypes/platform failure
-            pass
         return None
-    try:
-        with open("/proc/meminfo") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024     # kB -> bytes
-    except OSError:
-        pass
-    return None
 
 # Trace colour palette (cycled across all plots).
 _PALETTE = [
@@ -137,22 +102,21 @@ class _Bridge(QtCore.QObject):
 
 
 class TelemetryViewBox(pg.ViewBox):
-    """ViewBox whose wheel zoom obeys the running/stopped state machine.
+    """ViewBox that carries the "Export all…" item on a stripped context menu.
 
-    The wheel always changes the sample window by a factor of two. While the
-    stream is running the window stays anchored to the latest sample (the main
-    window keeps following); while stopped it zooms around the mouse pointer.
+    Wheel zoom and pan use pyqtgraph's native X-only handling (the plot is set up
+    with ``setMouseEnabled(x=True, y=False)`` in ``_build_plots``); this subclass
+    exists only to replace the default ViewBox menu.
     """
 
     def __init__(self, window: "MainWindow", **kwargs) -> None:
         super().__init__(**kwargs)
         self._win = window
-        self._menu = None   # empty stand-in for the stripped ViewBox menu
+        self._menu = None   # stand-in menu holding just "Export all…"
 
     def getMenu(self, ev):
         # Strip the default ViewBox context menu (axis range, mouse mode, axis
-        # linking): navigation here is owned by the wheel state machine and the
-        # Start/Stop follow logic, so those entries only fight the app. The menu
+        # linking): those entries only fight the Start/Stop follow logic. The menu
         # carries just our "Export all…" item; raiseContextMenu then appends the
         # scene's built-in exporter (renamed "qtgraph export…" in MainWindow).
         if self._menu is None:
@@ -160,16 +124,6 @@ class TelemetryViewBox(pg.ViewBox):
             act = self._menu.addAction("Export all…")
             act.triggered.connect(self._win.export_all_csv)
         return self._menu
-
-    def wheelEvent(self, ev, axis=None):
-        delta = ev.delta() if hasattr(ev, "delta") else ev.angleDelta().y()
-        factor = 0.5 if delta > 0 else 2.0   # wheel up = zoom in = shorter window
-        try:
-            x = self.mapSceneToView(ev.scenePos()).x()
-        except Exception:
-            x = None
-        self._win.on_wheel(factor, x)
-        ev.accept()
 
 
 class _DeviceCombo(QtWidgets.QComboBox):
@@ -218,11 +172,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ring: Optional[RingBuffer] = None
         self._running = False
         # Two independent sample windows: how much data we KEEP (history, set by
-        # the spin box) vs how much we SHOW (view, set by the wheel), both counted
-        # in samples. The wheel never touches retention, so zooming cannot discard
-        # data.
+        # the combo box) vs how much we SHOW (the view, set by the wheel via
+        # pyqtgraph's native X zoom). The view never touches retention, so zooming
+        # cannot discard data.
         self._history_n = DEFAULT_HISTORY_N
-        self._view_n = float(DEFAULT_VIEW_N)
 
         self._plots: List[pg.PlotItem] = []
         self._visible_plots: List[pg.PlotItem] = []   # currently laid-out subset
@@ -758,6 +711,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 plot.setXLink(self._plots[0])
             vb.setAutoVisible(y=True)
             vb.enableAutoRange(x=False, y=True)
+            # Native wheel/drag zoom the X window only; Y stays under auto-range.
+            vb.setMouseEnabled(x=True, y=False)
             self._plots.append(plot)
             self._group_fields.append(gfis)
 
@@ -784,9 +739,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Everything built here is currently laid out; the X-axis follows the first.
         self._visible_plots = list(self._plots)
         self._primary_plot = self._plots[0] if self._plots else None
-        # Restore the pre-rebuild pan/zoom (running redraw re-anchors next frame).
-        if saved_x is not None and self._primary_plot is not None:
-            self._primary_plot.getViewBox().setXRange(*saved_x, padding=0)
+        # Restore the pre-rebuild pan/zoom, or set the initial view width on a
+        # first build (a running redraw re-anchors to the latest sample next frame).
+        if self._primary_plot is not None:
+            x_range = saved_x if saved_x is not None else (0, DEFAULT_VIEW_N)
+            self._primary_plot.getViewBox().setXRange(*x_range, padding=0)
 
     def _add_field_row(self, name: str, type_str: str, color: Optional[str],
                        field_index: Optional[int]) -> QtWidgets.QTreeWidgetItem:
@@ -1002,9 +959,12 @@ class MainWindow(QtWidgets.QMainWindow):
         px = vb.width()
         px = int(px) if px and px > 1 else 1000
         if self._running:
-            # Following the latest sample at the current zoom width.
+            # Follow the latest sample, keeping whatever width the native wheel
+            # zoom has left in the view.
+            (vx0, vx1), _ = vb.viewRange()
+            width = max(1.0, vx1 - vx0)
             x1 = float(latest)
-            x0 = x1 - self._view_n
+            x0 = x1 - width
         else:
             (x0, x1), _ = vb.viewRange()
 
@@ -1032,23 +992,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     curve.setData(xx, yy)
 
         if self._running:
-            vb.setXRange(float(latest) - self._view_n, float(latest), padding=0)
-
-    # -- wheel state machine --------------------------------------------------
-
-    def on_wheel(self, factor: float, x: Optional[float]) -> None:
-        # The wheel changes the VIEW width only; it never trims the RingBuffer, so
-        # data outside the visible range is retained (up to the history size) and
-        # reappears when zooming back out.
-        self._view_n = min(MAX_WINDOW_N, max(MIN_WINDOW_N, self._view_n * factor))
-        if not self._running and self._primary_plot is not None and x is not None:
-            # Stopped: zoom around the pointer (X is linked across plots).
-            vb = self._primary_plot.getViewBox()
-            (x0, x1), _ = vb.viewRange()
-            nx0 = x - (x - x0) * factor
-            nx1 = x + (x1 - x) * factor
-            vb.setXRange(nx0, nx1, padding=0)
-        # Running: _redraw() keeps following the latest sample at the new width.
+            vb.setXRange(x0, x1, padding=0)
 
     # -- CSV export -----------------------------------------------------------
 
