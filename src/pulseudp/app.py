@@ -646,9 +646,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """(Re)build the plot widgets for the currently-drawable traces.
 
         A trace is drawn unless it is locally hidden (``_hidden_keys`` — a field or
-        flag checkbox the user unchecked). A plot is omitted when it has no drawable
-        trace, or (v2.0) when every drawable trace's channel is disabled on the
-        server, so hiding the last channel/flag of a group removes its graph.
+        flag checkbox the user unchecked) or (v2.0) its channel is disabled on the
+        server; undrawn traces get no curve, hence no legend entry. A plot is
+        omitted when it has no drawable trace, so hiding/disabling the last
+        channel/flag of a group removes its graph.
 
         ``preserve_view`` keeps the current X pan/zoom across the rebuild (the new
         ViewBoxes would otherwise reset to defaults); it is the common case, since
@@ -676,9 +677,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         row = 0
         for group in self._model.groups:
-            visible = [tr for tr in group.traces if tr.key not in self._hidden_keys]
+            # Drop locally-hidden traces and (v2.0) server-disabled channels, so
+            # neither gets a curve or a legend entry. Bit keys ("field.bit") map
+            # to no index, so _channel_on(None) keeps them; a disabled bitfield
+            # is dropped whole by the gfis check below.
+            visible = [tr for tr in group.traces
+                       if tr.key not in self._hidden_keys
+                       and self._channel_on(index_by_name.get(tr.key))]
             if not visible:
-                continue   # every channel/flag of this group hidden locally
+                continue   # every channel/flag of this group hidden or disabled
             # Descriptor channels feeding this plot: a bitfield plot is fed by its
             # one field; a numeric plot by each of its traces' fields.
             if group.kind == "bitfield":
