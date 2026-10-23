@@ -1,10 +1,9 @@
 # pulseUDP client — GUI design
 
-This is the implementation guide for deliverable #2, the desktop telemetry client.
-It implements the protocol in [`../spec/RFC-pulseUDP.md`](../spec/RFC-pulseUDP.md) and
+The desktop telemetry client implements the protocol in [`../spec/RFC-pulseUDP.md`](../spec/RFC-pulseUDP.md) and
 parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json).
 
-## Confirmed decisions
+## Decisions
 
 - **Qt binding:** PyQt5. Best support across the `requires-python >=3.8` range and most
   battle-tested with pyqtgraph. PyQt5 is **GPLv3**, so the released app is GPLv3.
@@ -21,12 +20,11 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
   multi-GiB range without the GUI lagging — see [Rendering pipeline](#rendering-pipeline-ring-buffer--minmax-pyramid).
   A requested size that would not fit in free RAM is **rejected** (the previous, smaller size is
   kept) so the client never tries to allocate beyond memory.
-- **Test source:** a UDP simulator (`tools/sim.py`), since the microcontroller firmware is
-  out of scope and no real device exists.
+- **Test source:** a UDP simulator (`tools/sim.py`); the microcontroller firmware is out of scope.
 - **Grouping:** fields sharing `units` share one plot; **unitless fields get one plot each**;
   each `bitfield` is one stacked digital plot with one colored trace per bit (`Reserved`
   bits hidden).
-- **Protocol version:** auto-negotiated, not chosen in the UI. On `Connect` the client sends the
+- **Protocol version:** auto-negotiated. On `Connect` the client sends the
   opening `DESCRIPTION` framed at the highest supported version (v2.0: active sequence + real
   CRC-16/CCITT-FALSE, RFC §3.2) and **fixates the session to whatever version the server
   reveals in its reply** (RFC §6.1). Because a server answers any request regardless of its
@@ -41,7 +39,7 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
   / short-datagram / decode-size-mismatch are active in both versions. A payload length that is
   not word-aligned logs an `align` row but is still decoded tolerantly (checked after the CRC, so
   a corrupt header never triggers it). A v2.0 reassembly that over-runs its declared length or
-  times out logs a `reasm` row and drops the message (all-or-nothing, RFC §5.6).
+  times out (300 ms) logs a `reasm` row and drops the message (all-or-nothing, RFC §5.6).
 - **Client callbacks:** `UdpClient` is Qt-free; telemetry (per-field physical arrays for the
   enabled channels), log events and state changes arrive as plain callables on the receiver
   thread, and the GUI marshals them onto the GUI thread through Qt signals. Every request is
@@ -59,19 +57,19 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
 
 ## Module layout (`src/pulseudp/`)
 
-- `protocol.py` *(exists; extended)* — header framing, `MessageType`, `TYPE_WORDS`, plus
+- `protocol.py` — header framing, `MessageType`, `TYPE_WORDS`, plus
   `Descriptor` (parse + validate, build decode plan) and the NumPy decoder.
-- `client.py` *(new)* — `UdpClient`: socket lifecycle, `DESCRIPTION`/`TELEMETRY`/`STOP`
+- `client.py` — `UdpClient`: socket lifecycle, `DESCRIPTION`/`TELEMETRY`/`STOP`
   transactions with retransmit timeout, receiver thread; Qt-free — samples, log events and
   state changes are plain callbacks, which `app.py` marshals onto the GUI thread via Qt signals.
-- `discovery.py` *(new)* — pluggable `Discovery` interface with two backends: `SsdpDiscovery`
+- `discovery.py` — pluggable `Discovery` interface with two backends: `SsdpDiscovery`
   (the GUI default — an SSDP/UPnP M-SEARCH probe, see [Discovery](#discovery-search-button)) and
   `NullDiscovery` (finds nothing). SSDP is a separate standard protocol, so this keeps the pulseUDP
   RFC itself discovery-free.
-- `model.py` *(new)* — `RingBuffer` (sample-counter X, sample-bounded history), channel/units
+- `model.py` — `RingBuffer` (sample-counter X, sample-bounded history), channel/units
   grouping.
-- `app.py` *(replaces stub)* — `MainWindow` and panels.
-- `tools/sim.py` *(new)* — UDP telemetry simulator.
+- `app.py` — `MainWindow` and panels.
+- `tools/sim.py` — UDP telemetry simulator.
 
 ## Threading & data flow
 
@@ -155,8 +153,7 @@ draws at screen resolution without per-frame work proportional to its size. Two 
 **channel-major** and built for ≤16 simultaneous channels:
 
 - **Raw ring** — a preallocated `(n_channels, capacity)` `float32` array with a wrapping write
-  index. Appends are a single vectorised slice-assign (no per-frame concatenation, the old chunk
-  list's cost); the X axis is *not* stored — it is the integer sample index, regenerated as
+  index. Appends are a single vectorised slice-assign; the X axis is *not* stored — it is the integer sample index, regenerated as
   `float64` on read (`float32` cannot represent sample indices past `2**24`). `float32` halves the
   footprint versus the decoded `float64`, which matters at large windows; plotting needs only
   ~7 digits.
@@ -188,8 +185,8 @@ whose bucket spans ≤ one pixel (`L = ⌊log_F(spp)⌋`, clamped). It then slic
 rings over the visible range and returns ~`2 · pixel_width` points. When zoomed in past one
 sample per pixel — or when no complete bucket covers the range yet — it returns **exact raw
 samples** instead (min = max). X of a decimated bucket is its centre. The GUI draws an envelope by emitting
-two points per bucket (min then max) at the bucket's X, so spikes survive decimation; this is the
-agreed trade-off — **every level except the finest shows the min/max envelope, the finest is exact
+two points per bucket (min then max) at the bucket's X, so spikes survive decimation:
+**every level except the finest shows the min/max envelope, the finest is exact
 samples**. Disabled v2.0 channels are all-NaN and reduce to NaN buckets, which draw as gaps.
 
 `pyqtgraph`'s own auto-downsampling is therefore left off (we pre-decimate), and global
@@ -211,7 +208,7 @@ count is known on connect an over-budget default is clamped down to the largest 
 The pulseUDP RFC defines no discovery handshake, so the **Search** button uses a standard,
 RFC-independent mechanism instead: an **SSDP/UPnP M-SEARCH** probe (`discovery.SsdpDiscovery`,
 the GUI default). SSDP only locates a host's IP address; the client then addresses it on the
-telemetry port exactly as if the IP had been typed in, so nothing about the wire protocol changes.
+telemetry port exactly as if the IP had been typed in.
 
 - **Probe.** A `M-SEARCH * HTTP/1.1` datagram (`MAN: "ssdp:discover"`, `MX: 2`, `ST: ssdp:all` —
   the broadest target) is multicast to `239.255.255.250:1900`. On a **multi-homed host** (common
@@ -230,7 +227,7 @@ telemetry port exactly as if the IP had been typed in, so nothing about the wire
   `search()` runs on a worker thread; the Search button shows *Searching…* and is disabled until
   results arrive on the GUI thread via a Qt signal. Discovery progress is mirrored to the log dock.
 
-`NullDiscovery` (finds nothing) remains available for environments with no SSDP responders or
+`NullDiscovery` (finds nothing) is for environments with no SSDP responders or
 where multicast is undesirable.
 
 ## Simulator (`tools/sim.py`)
@@ -263,17 +260,9 @@ py -3.8 tools/sim.py --version 2.0 --packets-per-message 200                    
 
 ## Testing
 
-Headless units: descriptor → decode-plan correctness, decode round-trip vs `tools/sim.py`,
-ring-buffer trim-by-sample-window, sequence-gap detection. GUI smoke test optional
-(`pytest-qt`), kept minimal.
-
-## Implementation status
-
-Nothing is currently deferred. Device discovery is implemented via SSDP (see
-[Discovery](#discovery-search-button)), and v2.0 channel selection via `GET_CHANNELS` /
-`SET_CHANNELS` (RFC §4, see [UI layout](#ui-layout-single-window-stacked-panels)).
-
-The v2.0 wire path is fully implemented: the CRC is validated (CRC-16/CCITT-FALSE, RFC §3.2)
-and large messages split across several datagrams are reassembled length-delimited (RFC §5.6,
-300 ms timeout, all-or-nothing) — exercised by `tools/sim.py --version 2.0 --descriptor
-spec/examples/telemetry_long_example.json`, whose descriptor reply spans three datagrams.
+All tests are headless (no sockets, no Qt): descriptor decode plan, header framing, channel
+bitmap and CRC (`test_protocol`); grouping, ring buffer and pyramid (`test_model`); per-version
+wire rules, reassembly, channel selection and version negotiation (`test_client`); SSDP parsing
+and device assembly (`test_discovery`); the example descriptor against the schema and the
+packaged schema copy against `spec/` (`test_schema`, `test_packaging`). The GUI and the
+simulator are exercised manually.
