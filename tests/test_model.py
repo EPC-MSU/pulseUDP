@@ -53,8 +53,7 @@ def test_extract_returns_sample_count_and_all_channels():
 
 
 def test_flatten_subset_omits_disabled_then_ring_fills_nan():
-    # v2.0: only some channels enabled -> flatten yields only those; the buffer
-    # fills the disabled trace keys with NaN so they draw as gaps.
+    # Disabled trace keys are stored as NaN.
     d = Descriptor.from_json(DESC)
     model = PlotModel(d)
     channels = {"Timestamp": np.array([1.0, 2.0]),
@@ -110,8 +109,7 @@ def test_view_exact_when_zoomed_in():
 
 
 def test_view_decimates_to_min_max_buckets():
-    # Many samples per pixel -> envelope buckets. For a ramp y == index, bucket b
-    # at level-L stride s spans [b*s, (b+1)*s): min == b*s, max == b*s + s - 1.
+    # Ramp y == index: bucket b of stride s has min b*s, max b*s + s - 1.
     rb = RingBuffer(["a"], window_n=10000)
     rb.append(4096, {"a": np.arange(4096, dtype=float)})
     v = rb.view(0.0, 4095.0, max_points=16)      # 256 samples/pixel -> level 2 (stride 64)

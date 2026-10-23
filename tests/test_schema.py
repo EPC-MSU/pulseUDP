@@ -1,9 +1,4 @@
-"""Validate the example telemetry descriptor against the pulseUDP schema.
-
-The schema (``spec/Schema.json``) is the normative definition of a telemetry
-descriptor; the example (``spec/examples/telemetry_example.json``) must conform
-to it.
-"""
+"""The example descriptor must validate against spec/Schema.json."""
 
 import json
 from pathlib import Path

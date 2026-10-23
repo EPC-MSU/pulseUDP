@@ -1,10 +1,4 @@
-"""Tests for SSDP discovery (no sockets, no network).
-
-The socket/multicast plumbing of :class:`SsdpDiscovery` is exercised manually;
-here we pin the pure, decision-making pieces: SSDP header parsing, friendly-name
-extraction from a UPnP description, and the response -> device assembly (dedupe
-by responder, drop the nameless), with the HTTP fetch stubbed out.
-"""
+"""SSDP discovery's pure logic, HTTP fetch stubbed; socket plumbing is tested manually."""
 
 from pulseudp.discovery import (Device, NullDiscovery, SsdpDiscovery,
                                 extract_friendly_name, parse_ssdp_headers)
@@ -47,8 +41,6 @@ _DESC_XML = (
 )
 
 
-# -- header parsing -----------------------------------------------------------
-
 def test_parse_msearch_reply_lowercases_headers():
     headers = parse_ssdp_headers(_OK_REPLY)
     assert headers is not None
@@ -69,8 +61,6 @@ def test_parse_rejects_non_ssdp_datagram():
     assert parse_ssdp_headers(b"") is None
 
 
-# -- friendly-name extraction -------------------------------------------------
-
 def test_extract_friendly_name_namespaced_xml():
     assert extract_friendly_name(_DESC_XML) == "Bench rig 3"
     assert extract_friendly_name(_DESC_XML.encode("utf-8")) == "Bench rig 3"
@@ -86,8 +76,6 @@ def test_extract_friendly_name_absent_returns_none():
     assert extract_friendly_name("<root><device/></root>") is None
     assert extract_friendly_name("<root><friendlyName>   </friendlyName></root>") is None
 
-
-# -- response -> device assembly (HTTP fetch stubbed) -------------------------
 
 def _disco_with_names(name_by_location):
     """An SsdpDiscovery whose description fetch is replaced by a lookup table."""
@@ -134,8 +122,6 @@ def test_assemble_sorts_by_name():
     devices = disco._assemble_devices([(headers2, "10.0.0.2"), (headers1, "10.0.0.1")])
     assert [d.name for d in devices] == ["Alpha", "Zeta"]
 
-
-# -- NullDiscovery ------------------------------------------------------------
 
 def test_null_discovery_finds_nothing():
     assert NullDiscovery().search() == []

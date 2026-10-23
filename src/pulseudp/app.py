@@ -1,18 +1,4 @@
-"""pulseUDP GUI client.
-
-A single-window PyQt5 + pyqtgraph application that:
-
-  1. addresses / (later) discovers a server on UDP port 2102,
-  2. requests the JSON descriptor (``DESCRIPTION``) and builds the plot layout,
-  3. starts the telemetry stream (``TELEMETRY``) and plots it live,
-  4. stops the stream (``STOP``).
-
-Architecture (see docs/gui-design.md): a :class:`~pulseudp.client.UdpClient`
-receiver thread decodes datagrams and appends to a thread-safe
-:class:`~pulseudp.model.RingBuffer`; a ``QTimer`` on the GUI thread redraws the
-curves at a fixed rate. Network log/state callbacks are marshalled onto the GUI
-thread through Qt signals.
-"""
+"""pulseUDP GUI client (PyQt5 + pyqtgraph); design in docs/gui-design.md."""
 
 from __future__ import annotations
 
@@ -41,35 +27,24 @@ from .protocol import Descriptor
 
 DEFAULT_PORT = 2102
 REDRAW_HZ = 30
-# The X axis counts samples, not seconds: windows are sample counts.
-DEFAULT_VIEW_N = 500        # initial view width: samples per screen
-DEFAULT_HISTORY_N = 1_000_000   # initial rolling-history retention (combo-controlled)
+DEFAULT_VIEW_N = 500            # samples per screen
+DEFAULT_HISTORY_N = 1_000_000   # retained samples
 
-# Selectable rolling-history sizes (samples). Retention is picked from this list,
-# not free-typed, because the only meaningful axis is order of magnitude and a
-# big value must be checked against free RAM before it is allocated.
 HISTORY_OPTIONS = [
     ("1K", 1_000), ("10K", 10_000), ("100K", 100_000), ("1M", 1_000_000),
     ("10M", 10_000_000), ("100M", 100_000_000), ("1G", 1_000_000_000),
 ]
-# Fraction of currently-available RAM a new history buffer may claim.
 RAM_BUDGET_FRACTION = 0.8
 
 
 def _available_ram_bytes() -> Optional[int]:
-    """Best-effort free RAM in bytes; None if psutil cannot read it.
-
-    ``psutil`` ships in the ``gui`` extra alongside PyQt5/pyqtgraph/numpy; the
-    None fallback leaves the RAM guard inert rather than guessing if it is
-    somehow unavailable.
-    """
+    """Free RAM in bytes; None (RAM guard inert) if psutil cannot read it."""
     try:
         import psutil
         return int(psutil.virtual_memory().available)
     except Exception:  # noqa: BLE001 - psutil missing or failed
         return None
 
-# Trace colour palette (cycled across all plots).
 _PALETTE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
     "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "#aec7e8", "#ffbb78",
@@ -77,11 +52,7 @@ _PALETTE = [
 
 
 def _load_schema() -> Optional[dict]:
-    """Load the bundled descriptor schema (validation is optional).
-
-    The schema ships as package data (``pulseudp/data/Schema.json``), so it is
-    available in installed wheels and frozen builds, not just source checkouts.
-    """
+    """Bundled package-data schema, so it works in wheels and frozen builds too."""
     try:
         raw = pkgutil.get_data("pulseudp", "data/Schema.json")
         return json.loads(raw.decode("utf-8")) if raw else None
@@ -102,23 +73,15 @@ class _Bridge(QtCore.QObject):
 
 
 class TelemetryViewBox(pg.ViewBox):
-    """ViewBox that carries the "Export all…" item on a stripped context menu.
-
-    Wheel zoom and pan use pyqtgraph's native X-only handling (the plot is set up
-    with ``setMouseEnabled(x=True, y=False)`` in ``_build_plots``); this subclass
-    exists only to replace the default ViewBox menu.
-    """
+    """Replaces the default ViewBox menu with "Export all…" (docs/gui-design.md, Context menu)."""
 
     def __init__(self, window: "MainWindow", **kwargs) -> None:
         super().__init__(**kwargs)
         self._win = window
-        self._menu = None   # stand-in menu holding just "Export all…"
+        self._menu = None
 
     def getMenu(self, ev):
-        # Strip the default ViewBox context menu (axis range, mouse mode, axis
-        # linking): those entries only fight the Start/Stop follow logic. The menu
-        # carries just our "Export all…" item; raiseContextMenu then appends the
-        # scene's built-in exporter (renamed "qtgraph export…" in MainWindow).
+        # raiseContextMenu appends the scene exporter after this item.
         if self._menu is None:
             self._menu = QtWidgets.QMenu()
             act = self._menu.addAction("Export all…")
@@ -127,15 +90,7 @@ class TelemetryViewBox(pg.ViewBox):
 
 
 class _DeviceCombo(QtWidgets.QComboBox):
-    """Discovered-device dropdown.
-
-    It prefers a wide box (so device labels rarely truncate) but is the control
-    that gives up width first when the window is narrowed — the Address field
-    beside it keeps a fixed width. This is achieved by a wide preferred size with
-    a small minimum (the box elides the text and the per-item tooltip still shows
-    the full label); a ``Preferred`` policy leaves slack to the trailing stretch
-    rather than growing the box past its preferred width.
-    """
+    """Wide preferred, small minimum: the first control to yield width."""
 
     PREFERRED_W = 320
     MINIMUM_W = 120
@@ -163,47 +118,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("pulseUDP client v{}".format(__version__))
 
         self._schema = _load_schema()
-        # SSDP is the GUI default; the Search button probes the LAN for devices.
-        # Discovery logs go through the bridge (search runs off the GUI thread).
+        # Search runs off the GUI thread, so its logs go through the bridge.
         self._discovery = discovery or SsdpDiscovery(
             on_log=lambda level, msg: self._bridge.disco_log.emit(level, msg))
         self._client: Optional[UdpClient] = None
         self._model: Optional[PlotModel] = None
         self._ring: Optional[RingBuffer] = None
         self._running = False
-        # Two independent sample windows: how much data we KEEP (history, set by
-        # the combo box) vs how much we SHOW (the view, set by the wheel via
-        # pyqtgraph's native X zoom). The view never touches retention, so zooming
-        # cannot discard data.
+        # Retention only; the view width is pyqtgraph's X zoom.
         self._history_n = DEFAULT_HISTORY_N
 
         self._plots: List[pg.PlotItem] = []
-        self._visible_plots: List[pg.PlotItem] = []   # currently laid-out subset
+        self._visible_plots: List[pg.PlotItem] = []
         self._primary_plot: Optional[pg.PlotItem] = None  # X-axis anchor
         self._group_fields: List[List[int]] = []      # channel indices per plot
         self._link_vb: Optional[pg.ViewBox] = None
         self._curves: Dict[str, pg.PlotDataItem] = {}
         self._bit_offset: Dict[str, int] = {}   # bit trace key -> stack row
 
-        # Channel checkboxes drive two different mechanisms depending on the
-        # negotiated version:
-        #   * v2.0 (server negotiation, RFC §4) — a field-level box per channel
-        #     tells the server to start/stop sending it; live only while stopped.
-        #   * v1.0 (local visibility) — the server channel list is immutable, so
-        #     the boxes instead show/hide curves on the graphs client-side. Both
-        #     field-level boxes and per-bit ("flag") boxes are live, even while
-        #     streaming, and removing every trace of a plot removes the plot.
-        # The checkboxes are native tree-item check states (drawn by the item
-        # delegate, so indentation/margins are handled by Qt), keyed by the same
-        # field index / bit trace key as before; the values are the rows themselves.
+        # Checkbox semantics per version: docs/gui-design.md (UI layout, Telemetry list).
         self._channel_checks: Dict[int, QtWidgets.QTreeWidgetItem] = {}  # field idx -> row
         self._bit_checks: Dict[str, QtWidgets.QTreeWidgetItem] = {}      # bit key -> row
         self._field_trace_keys: Dict[int, List[str]] = {}  # field index -> its trace keys
         self._trace_color: Dict[str, str] = {}             # trace key -> fixed colour
         self._hidden_keys: set = set()  # locally hidden trace keys (both versions)
-        # Server-enabled channel set (v2.0 negotiation); None means "all on", which
-        # is always the case in v1.0. Orthogonal to _hidden_keys (local show/hide).
-        self._enabled_channels: Optional[List[bool]] = None
+        self._enabled_channels: Optional[List[bool]] = None   # v2.0 server set; None = all on
         self._selectable = False        # True once a v2.0 session is negotiated
         self._local_filter = False      # True on a v1.0 session (local field hide)
         self._suppress_check = False    # guard against re-entrant checkbox updates
@@ -224,11 +163,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._timer.timeout.connect(self._redraw)
         self._timer.start(int(1000 / REDRAW_HZ))
 
-    # -- UI construction ------------------------------------------------------
+    TREE_W = 280
 
-    TREE_W = 280   # initial width of the telemetry list pane
-
-    # Per-row metadata stored on column 0: what the row's checkbox controls.
     _ROLE_KIND = QtCore.Qt.UserRole          # "field" | "bit"
     _ROLE_REF = QtCore.Qt.UserRole + 1       # field index (int) | bit key (str)
 
@@ -247,9 +183,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tele_layout = QtWidgets.QVBoxLayout(tele_box)
         self._tree = QtWidgets.QTreeWidget()
         self._tree.setHeaderLabels(["", "Name", "Type"])
-        # Column 0 holds the show/hide checkbox as a native item check state, so the
-        # delegate draws it with the correct indentation for nested (bit) rows and
-        # ResizeToContents sizes the column to fit — no manual width/indent math.
+        # Column 0: native check state, so Qt handles nested-row indentation.
         self._tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         self._tree.setColumnWidth(1, 180)
         self._tree.itemChanged.connect(self._on_item_changed)
@@ -258,9 +192,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._graphs = pg.GraphicsLayoutWidget()
         self._graphs.setBackground("w")
-        # Rename pyqtgraph's built-in scene exporter (the only default menu item
-        # kept, see TelemetryViewBox.getMenu) so it reads as the library's own,
-        # distinct from our "Export all…" CSV dump beside it.
         for act in self._graphs.scene().contextMenu:
             if act.text().startswith("Export"):
                 act.setText("qtgraph export…")
@@ -270,9 +201,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_log_dock()
 
-        # Default window width = the smallest width that shows the connection bar
-        # without shortening any control (the device list is the only one that
-        # gives up width when narrowed further). Height is a comfortable default.
+        # Narrowest width that shows the whole connection bar.
         m = outer.contentsMargins()
         width = self._conn_box.sizeHint().width() + m.left() + m.right()
         self.resize(width, 760)
@@ -292,7 +221,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         row.addWidget(QtWidgets.QLabel("Address:"))
         self._ip_edit = QtWidgets.QLineEdit("127.0.0.1")
-        self._ip_edit.setFixedWidth(140)   # stays put; the device list yields width instead
+        self._ip_edit.setFixedWidth(140)
         row.addWidget(self._ip_edit)
 
         self._connect_btn = QtWidgets.QPushButton("Connect")
@@ -317,7 +246,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._history_combo.currentIndexChanged.connect(self._on_history_changed)
         row.addWidget(self._history_combo)
 
-        row.addStretch(1)   # keep the controls left-aligned
+        row.addStretch(1)
         return box
 
     def _build_log_dock(self) -> None:
@@ -330,15 +259,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, dock)
         self._log_dock = dock
 
-    # -- connection / streaming controls --------------------------------------
-
     def _run_async(self, fn) -> None:
         """Run a (blocking) client transaction off the GUI thread."""
         threading.Thread(target=fn, daemon=True).start()
 
     def _on_search(self) -> None:
-        # The SSDP probe blocks for a few seconds (multicast wait + HTTP fetches),
-        # so it runs off the GUI thread; results return via the bridge.
         self._search_btn.setEnabled(False)
         self._search_btn.setText("Searching…")
         self._append_log("info", "Searching for devices (SSDP)…")
@@ -362,12 +287,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log("info", "Search found no devices.")
             return
         for d in devices:
-            # Display name + address; the address is the item data the IP field
-            # is filled from on selection (see _on_device_selected).
             label = "{} ({})".format(d.name, d.address)
             self._device_combo.addItem(label, d.address)
-            # Full label as a per-item tooltip so a name truncated by the combo
-            # width is still readable on hover (Qt shows it for the row).
+            # Tooltip shows a label the narrowed combo elides.
             self._device_combo.setItemData(
                 self._device_combo.count() - 1, label, QtCore.Qt.ToolTipRole)
         self._append_log("info", "Search found {} device(s).".format(len(devices)))
@@ -381,21 +303,18 @@ class MainWindow(QtWidgets.QMainWindow):
         host = self._ip_edit.text().strip()
         if not host:
             return
-        # Tear down any previous session.
         self._teardown_client()
         self._running = False
         self._start_btn.setText("Start")
         self._start_btn.setEnabled(False)
-        # Neutralize channel selection until the new descriptor/version is known
-        # (avoids a stale checkbox from the old session pushing SET_CHANNELS).
+        # Until the new version is known, so a stale box can't push SET_CHANNELS.
         self._selectable = False
         self._local_filter = False
         self._hidden_keys = set()
         self._enabled_channels = None
         self._set_checks_enabled(False)
 
-        # No version selector: the client probes at v2.0 and adopts whatever
-        # version the server reveals in its DESCRIPTION reply (RFC §6.1).
+        # Version is auto-negotiated by the client (RFC §6.1).
         client = UdpClient(
             host, DEFAULT_PORT, schema=self._schema,
             on_telemetry=self._on_telemetry,
@@ -432,12 +351,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return len(self._model.channel_keys) if self._model is not None else None
 
     def _history_fits(self, window_n: int) -> bool:
-        """True if a ``window_n`` buffer fits the RAM budget.
-
-        Optimistic when the answer cannot be known yet — no descriptor (channel
-        count unknown) or no RAM reading available. The authoritative check runs
-        in :meth:`_on_descriptor` once the real channel count is in hand.
-        """
+        """RAM guard; optimistic until the channel count is known (docs/gui-design.md)."""
         channels = self._channel_count()
         avail = _available_ram_bytes()
         if channels is None or avail is None:
@@ -453,10 +367,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._history_combo.blockSignals(False)
 
     def _on_history_changed(self, index: int) -> None:
-        # The combo controls data RETENTION only — never the zoom.
         value = int(self._history_combo.itemData(index))
         if not self._history_fits(value):
-            # _history_fits only rejects when the channel count is known.
             channels = self._channel_count() or 0
             need = RingBuffer.footprint_bytes(channels, value)
             self._append_log(
@@ -471,12 +383,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._ring is not None:
             self._ring.set_window(self._history_n)
 
-    # -- bridge slots (GUI thread) --------------------------------------------
-
     def _on_descriptor(self, descriptor: Descriptor) -> None:
         self._model = PlotModel(descriptor)
-        # Now that the real channel count is known, the chosen history may no
-        # longer fit; clamp down to the largest option that does.
+        # The real channel count is known now: clamp history to what fits.
         if not self._history_fits(self._history_n):
             for _, value in reversed(HISTORY_OPTIONS):
                 if value <= self._history_n and self._history_fits(value):
@@ -488,8 +397,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._select_history_value(self._history_n)
         self._ring = RingBuffer(self._model.channel_keys, window_n=self._history_n)
         self._n_channels = len(descriptor.fields)
-        # Server-side channel negotiation is a v2.0 feature; in v1.0 the list is
-        # immutable on the wire, so the boxes drive local show/hide instead.
         v2 = (self._client is not None and self._client.version[0] >= 2)
         self._selectable = v2
         self._local_filter = not v2
@@ -497,7 +404,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._enabled_channels = None   # server set arrives via get_channels (v2.0)
         self._build_plots(descriptor)
         self._start_btn.setEnabled(True)
-        # v2.0: read the server's current enabled set and reflect it (RFC §4).
         if self._selectable and self._client is not None:
             client = self._client
 
@@ -511,25 +417,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_async(work)
 
     def _on_state(self, state: str, detail: str) -> None:
-        # Connection lifecycle is reported through the log. Only states the log
-        # does not already cover are surfaced here — an "error" state is skipped
-        # because the matching raised exception is logged by _on_error, and
-        # "negotiated protocol" is already logged by the client (the "connected"
-        # line adds descriptor/field info).
+        # "error" is not logged here: _on_error already logs the exception.
         if state == "streaming":
             self._running = True
             self._start_btn.setText("Stop")
-            self._set_checks_enabled(False)   # can't change channels mid-stream
+            self._set_checks_enabled(False)
             self._append_log("info", "Streaming")
         elif state in ("stopped", "disconnected", "error"):
             self._running = False
             self._start_btn.setText("Start")
-            self._set_checks_enabled(True)     # selectable again once stopped
+            self._set_checks_enabled(True)
             if state == "stopped":
                 self._append_log("info", "Stopped")
             elif state == "disconnected":
                 self._append_log("info", "Disconnected")
-            # "error": already logged via _on_error / the raised exception.
         elif state == "connecting":
             self._append_log("info",
                              "Connecting to {}".format(detail) if detail else "Connecting")
@@ -547,38 +448,20 @@ class MainWindow(QtWidgets.QMainWindow):
         stamp = time.strftime("%H:%M:%S")
         self._log.appendPlainText("{} {:<7} {}".format(stamp, level.upper(), message))
 
-    # -- telemetry ingest (receiver thread) -----------------------------------
-
     def _on_telemetry(self, channels: Dict[str, np.ndarray]) -> None:
-        # Runs on the client's receiver thread; RingBuffer is thread-safe.
-        # ``channels`` covers only the enabled fields (v2.0 subset); flatten maps
-        # them to trace keys and the RingBuffer fills disabled ones with NaN.
+        # Receiver thread; RingBuffer is thread-safe.
         if self._model is None or self._ring is None:
             return
         n, flat = self._model.flatten(channels)
         self._ring.append(n, flat)
 
-    # -- plot building & redraw -----------------------------------------------
-
     def _build_plots(self, descriptor: Descriptor) -> None:
-        """Build the channel tree (once) and render the plots for it.
-
-        The tree carries every channel and its checkbox and is built once per
-        connection; the plot area is (re)rendered from the currently-visible
-        trace subset, so a v1.0 local show/hide only re-renders the plots.
-        """
+        """Tree once per connection; plots are re-rendered on every show/hide."""
         self._build_channel_tree(descriptor)
         self._render_plots()
 
     def _build_channel_tree(self, descriptor: Descriptor) -> None:
-        """Populate the telemetry tree: one top-level row per field, plus a child
-        row per bit of each bitfield, each with a show/hide checkbox.
-
-        Trace colours are fixed here (``_trace_color``) so they stay stable in the
-        swatches and the curves no matter which subset is currently rendered.
-        """
-        # Setting check states / flags / icons emits itemChanged; suppress so the
-        # build does not fire the toggle handlers.
+        """Field rows + per-bit child rows; trace colours are fixed here."""
         prev_suppress = self._suppress_check
         self._suppress_check = True
         try:
@@ -593,8 +476,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._field_trace_keys = {}
         self._trace_color = {}
         color_i = 0
-        # Field name -> descriptor index (= channel index in the bitmap, RFC §4).
-        index_by_name = {f.name: i for i, f in enumerate(descriptor.fields)}
+        index_by_name = {f.name: i for i, f in enumerate(descriptor.fields)}   # = RFC §4 bitmap index
         field_by_name = {f.name: f for f in descriptor.fields}
 
         for group in self._model.groups:
@@ -628,37 +510,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._add_field_row(tr.label, fld.type if fld else "", color, fi)
 
         self._tree.expandToDepth(0)
-        self._sync_bit_enables()   # flags follow their parent channel (both versions)
+        self._sync_bit_enables()
 
     def _channel_on(self, field_index: Optional[int]) -> bool:
-        """Whether a descriptor channel is currently streaming data.
-
-        True for every channel in v1.0 (and in v2.0 until the server's enabled set
-        is known); in v2.0 it reflects the server-negotiated set. A channel that is
-        off carries only NaN, so a plot fed solely by off channels is dropped.
-        """
+        """Streaming per the v2.0 server set; always True in v1.0 or before the set is known."""
         enabled = self._enabled_channels
         if enabled is None or field_index is None:
             return True
         return field_index < len(enabled) and bool(enabled[field_index])
 
     def _render_plots(self, preserve_view: bool = True) -> None:
-        """(Re)build the plot widgets for the currently-drawable traces.
-
-        A trace is drawn unless it is locally hidden (``_hidden_keys`` — a field or
-        flag checkbox the user unchecked) or (v2.0) its channel is disabled on the
-        server; undrawn traces get no curve, hence no legend entry. A plot is
-        omitted when it has no drawable trace, so hiding/disabling the last
-        channel/flag of a group removes its graph.
-
-        ``preserve_view`` keeps the current X pan/zoom across the rebuild (the new
-        ViewBoxes would otherwise reset to defaults); it is the common case, since
-        toggling a checkbox should not jump the view. Cheap enough to call on every
-        toggle — a user action, not a per-frame cost.
-        """
+        """(Re)build plots for drawn traces only; ``preserve_view`` keeps the X pan/zoom."""
         if self._model is None:
             return
-        # Capture the shared X range before tearing the old ViewBoxes down.
         saved_x = None
         if preserve_view and self._primary_plot is not None:
             try:
@@ -668,41 +532,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._graphs.clear()
         self._plots = []
-        self._group_fields = []   # parallel to _plots: channel indices feeding each
+        self._group_fields = []
         self._curves = {}
         self._bit_offset = {}
         self._link_vb = None
-        # Field name -> descriptor index (= channel index in the bitmap, RFC §4).
         index_by_name = {f.name: i for i, f in enumerate(self._model.descriptor.fields)}
 
         row = 0
         for group in self._model.groups:
-            # Drop locally-hidden traces and (v2.0) server-disabled channels, so
-            # neither gets a curve or a legend entry. Bit keys ("field.bit") map
-            # to no index, so _channel_on(None) keeps them; a disabled bitfield
-            # is dropped whole by the gfis check below.
+            # Bit keys map to no index; a disabled bitfield is dropped by the gfis check.
             visible = [tr for tr in group.traces
                        if tr.key not in self._hidden_keys
                        and self._channel_on(index_by_name.get(tr.key))]
             if not visible:
-                continue   # every channel/flag of this group hidden or disabled
-            # Descriptor channels feeding this plot: a bitfield plot is fed by its
-            # one field; a numeric plot by each of its traces' fields.
+                continue
             if group.kind == "bitfield":
                 gfis = [index_by_name.get(group.title)]
             else:
                 gfis = [index_by_name.get(tr.key) for tr in visible]
             gfis = [i for i in gfis if i is not None]
             if not any(self._channel_on(i) for i in gfis):
-                continue   # v2.0: all feeding channels disabled on the server
+                continue
 
             plot = self._graphs.addPlot(
                 row=row, col=0, viewBox=TelemetryViewBox(self))
             row += 1
-            # Drop the PlotItem ctrl menu (Transforms/Downsample/Average/Alpha/
-            # Grid/Points) — decimation is owned by the min/max pyramid and the
-            # transforms are meaningless on its envelope. The ViewBox menu is
-            # stripped in TelemetryViewBox; together this leaves only "Export…".
             plot.setMenuEnabled(False, None)
             plot.showGrid(x=True, y=True, alpha=0.3)
             plot.setLabel("bottom", "sample")
@@ -718,13 +572,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 plot.setXLink(self._plots[0])
             vb.setAutoVisible(y=True)
             vb.enableAutoRange(x=False, y=True)
-            # Native wheel/drag zoom the X window only; Y stays under auto-range.
             vb.setMouseEnabled(x=True, y=False)
             self._plots.append(plot)
             self._group_fields.append(gfis)
 
             if group.kind == "bitfield":
-                # Stack visible bits on integer rows; label the y axis with names.
                 ticks = []
                 for bi, tr in enumerate(visible):
                     self._bit_offset[tr.key] = bi
@@ -743,23 +595,14 @@ class MainWindow(QtWidgets.QMainWindow):
                         name=tr.label)
                     self._curves[tr.key] = curve
 
-        # Everything built here is currently laid out; the X-axis follows the first.
         self._visible_plots = list(self._plots)
         self._primary_plot = self._plots[0] if self._plots else None
-        # Restore the pre-rebuild pan/zoom, or set the initial view width on a
-        # first build (a running redraw re-anchors to the latest sample next frame).
         if self._primary_plot is not None:
             x_range = saved_x if saved_x is not None else (0, DEFAULT_VIEW_N)
             self._primary_plot.getViewBox().setXRange(*x_range, padding=0)
 
     def _add_field_row(self, name: str, type_str: str, color: Optional[str],
                        field_index: Optional[int]) -> QtWidgets.QTreeWidgetItem:
-        """Add a top-level field row with its channel checkbox.
-
-        In v2.0 the box negotiates the channel with the server (live only while
-        stopped, RFC §4); in v1.0 it shows/hides the field's curve(s) locally
-        (live always, even while streaming).
-        """
         item = QtWidgets.QTreeWidgetItem(["", name, type_str])
         if color:
             item.setIcon(1, self._swatch(color))
@@ -773,19 +616,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return item
 
     def _add_bit_check(self, item: QtWidgets.QTreeWidgetItem, key: str) -> None:
-        """Make a bitfield child row a per-bit ("flag") show/hide checkbox.
-
-        Flags are always hidden locally — in both versions — because a bitfield is
-        a single channel on the wire, so individual bits are never negotiated with
-        the server. The box is live whenever its parent channel is streaming.
-        """
         item.setData(0, self._ROLE_KIND, "bit")
         item.setData(0, self._ROLE_REF, key)
         item.setToolTip(0, "Show/hide this flag on the graph (local; not sent to the server)")
         self._set_checkable(item, checked=True, enabled=self._client is not None)
         self._bit_checks[key] = item
-
-    # -- native check-state helpers -------------------------------------------
 
     @staticmethod
     def _checked(item: QtWidgets.QTreeWidgetItem) -> bool:
@@ -794,13 +629,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_checkable(self, item: QtWidgets.QTreeWidgetItem,
                        checked: Optional[bool] = None,
                        enabled: Optional[bool] = None) -> None:
-        """Set a row's checkbox state/interactivity via native item flags.
-
-        Disabling clears ``ItemIsEnabled`` (the row greys out and the box stops
-        accepting clicks) rather than removing the box. Mutations emit
-        ``itemChanged``; callers run under ``_suppress_check`` so the handler
-        ignores programmatic changes.
-        """
+        """Callers hold ``_suppress_check``: these mutations emit ``itemChanged``."""
         flags = item.flags() | QtCore.Qt.ItemIsUserCheckable
         if enabled is not None:
             flags = (flags | QtCore.Qt.ItemIsEnabled if enabled
@@ -809,13 +638,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if checked is not None:
             item.setCheckState(0, QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
 
-    # -- channel selection (v2.0 negotiation / v1.0 local show-hide) -----------
-
     def _field_check_enabled(self) -> bool:
-        """Whether field checkboxes are interactive in the current session."""
-        if self._selectable:        # v2.0: only while stopped (server round trip)
+        if self._selectable:
             return not self._running
-        return self._local_filter   # v1.0: always (purely local)
+        return self._local_filter
 
     def _field_check_tip(self) -> str:
         if self._selectable:
@@ -825,14 +651,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return "Channel selection is available after connecting"
 
     def _set_checks_enabled(self, on: bool) -> None:
-        """Reflect interactivity of the checkboxes.
-
-        ``on`` carries the v2.0 stopped/running gate for the field boxes; v1.0
-        field boxes ignore it (local hide is allowed even mid-stream). Flag boxes
-        are always local, so they follow only their parent channel's state.
-        """
+        """``on`` gates v2.0 field boxes only; v1.0 and flag boxes ignore it."""
         prev = self._suppress_check
-        self._suppress_check = True         # flag mutations re-emit itemChanged
+        self._suppress_check = True
         try:
             field_on = bool(on) if self._selectable else self._local_filter
             for item in self._channel_checks.values():
@@ -842,12 +663,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._suppress_check = prev
 
     def _sync_bit_enables(self) -> None:
-        """A flag box is live whenever connected and its parent channel is shown.
-
-        Parent "shown" = its field box checked: in v1.0 that means not locally
-        hidden, in v2.0 it tracks the server-enabled set (a disabled channel sends
-        no data, so hiding its flags is moot).
-        """
+        """A flag box is live while connected and its parent field box is checked."""
         prev = self._suppress_check
         self._suppress_check = True
         try:
@@ -863,12 +679,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._suppress_check = prev
 
     def _recompute_hidden(self) -> None:
-        """Rebuild the locally-hidden trace set from the checkbox states.
-
-        A flag is hidden whenever its own box is unchecked (both versions). A field
-        is hidden by its box only in v1.0; in v2.0 the field box drives server
-        negotiation (reflected via ``_enabled_channels``), not a local hide.
-        """
         hidden: set = set()
         if self._local_filter:
             for fi, item in self._channel_checks.items():
@@ -880,11 +690,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hidden_keys = hidden
 
     def _on_item_changed(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
-        """A tree row changed: route a user check-state toggle to its handler.
-
-        ``itemChanged`` also fires for programmatic state/flag changes, which run
-        under ``_suppress_check``; those are ignored here.
-        """
         if self._suppress_check or column != 0:
             return
         kind = item.data(0, self._ROLE_KIND)
@@ -894,18 +699,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_bit_toggled()
 
     def _on_field_toggled(self) -> None:
-        """A field (whole-channel) checkbox changed.
-
-        v2.0: push the new field selection to the server with SET_CHANNELS.
-        v1.0: recompute the locally-hidden set and re-render the plots.
-        """
         if self._selectable:
             if self._running or self._client is None:
                 return
             desired = [True] * self._n_channels
             for idx, item in self._channel_checks.items():
                 desired[idx] = self._checked(item)
-            self._set_checks_enabled(False)  # lock the boxes during the round trip
+            self._set_checks_enabled(False)  # locked during the round trip
             client = self._client
 
             def work():
@@ -918,22 +718,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_async(work)
         elif self._local_filter:
             self._recompute_hidden()
-            self._sync_bit_enables()    # a hidden field greys out its flag boxes
+            self._sync_bit_enables()
             self._render_plots()
 
     def _on_bit_toggled(self) -> None:
-        """A per-bit ("flag") checkbox changed: hide/show that bit locally.
-
-        Always local in both versions — the bit is never negotiated with the
-        server — so it only recomputes the hidden set and re-renders the plots.
-        """
         self._recompute_hidden()
         self._render_plots()
 
     def _on_channels_result(self, enabled) -> None:
-        """Reflect the server's authoritative enabled set (v2.0) and re-render."""
+        """Reflect the server's authoritative v2.0 enabled set."""
         self._enabled_channels = list(enabled)
-        self._suppress_check = True         # programmatic update: don't re-emit
+        self._suppress_check = True
         try:
             for idx, item in self._channel_checks.items():
                 item.setCheckState(0, QtCore.Qt.Checked
@@ -942,9 +737,7 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._suppress_check = False
         if self._ring is not None:
-            self._ring.clear()              # packet layout changed; drop stale data
-        # Channel set (and so packet layout) changed and the buffer was cleared;
-        # start the view fresh rather than preserving a now-empty range.
+            self._ring.clear()              # packet layout changed
         self._render_plots(preserve_view=False)
         self._set_checks_enabled(not self._running)
 
@@ -961,13 +754,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if latest is None:
             return
         vb = self._primary_plot.getViewBox()
-        # Pixel width of the plot bounds how many points are worth drawing; the
-        # pyramid decimates to that, so render cost is independent of history size.
+        # Pixel width bounds the decimated point count.
         px = vb.width()
         px = int(px) if px and px > 1 else 1000
         if self._running:
-            # Follow the latest sample, keeping whatever width the native wheel
-            # zoom has left in the view.
+            # Follow latest, keeping the wheel-zoomed width.
             (vx0, vx1), _ = vb.viewRange()
             width = max(1.0, vx1 - vx0)
             x1 = float(latest)
@@ -987,8 +778,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         y = y * 0.8 + self._bit_offset[key]
                     curve.setData(view.x, y)
                 else:
-                    # Draw the per-bucket envelope: two points per bucket (min then
-                    # max) at the bucket's X, so spikes survive decimation.
+                    # Envelope: min then max per bucket, so spikes survive.
                     hi = view.ymax[key]
                     xx = np.repeat(view.x, 2)
                     yy = np.empty(lo.size * 2, dtype=np.float64)
@@ -1001,19 +791,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._running:
             vb.setXRange(x0, x1, padding=0)
 
-    # -- CSV export -----------------------------------------------------------
-
     def export_all_csv(self) -> None:
-        """Save every visible trace's full retained history to a CSV file.
-
-        "Visible" = the traces currently drawn (locally hidden channels/flags and
-        v2.0 server-disabled channels are excluded); "all" = the entire rolling
-        window the RingBuffer still holds, not just the on-screen X range — the
-        "qtgraph export…" item already covers the current image. The file is
-        tab-delimited with a header row (a synthetic ``sample`` index column plus
-        one column per trace, named by its key) and values at 5 significant
-        digits. The write runs off the GUI thread; the result is logged.
-        """
+        """Drawn traces' whole retained window to CSV (format: docs/gui-design.md)."""
         if self._ring is None or not self._curves:
             self._append_log("info", "Nothing to export yet.")
             return
@@ -1023,13 +802,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         ring = self._ring
-        keys = list(self._curves.keys())   # plot/column order; only drawn traces
+        keys = list(self._curves.keys())
 
         def work():
             try:
                 x, chans = ring.snapshot()
                 data = np.column_stack([x] + [chans[k] for k in keys])
-                # sample index as a plain integer; values at 5 significant digits.
                 fmt = ["%d"] + ["%.5g"] * len(keys)
                 np.savetxt(path, data, fmt=fmt, delimiter="\t",
                            header="\t".join(["sample"] + keys), comments="")
@@ -1042,8 +820,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._bridge.error.emit("Export failed: " + str(exc))
 
         self._run_async(work)
-
-    # -- teardown -------------------------------------------------------------
 
     def _teardown_client(self) -> None:
         if self._client is not None:
@@ -1060,9 +836,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def run() -> int:
-    """Launch the GUI. Returns a process exit code."""
-    # Antialiasing is costly on dense curves; the pyramid already caps point
-    # counts near the pixel width, so leave it off for smooth high-rate redraws.
+    """Launch the GUI; returns the exit code."""
     pg.setConfigOptions(antialias=False)
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()

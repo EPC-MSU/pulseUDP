@@ -1,21 +1,4 @@
-"""Device discovery (pluggable).
-
-The pulseUDP RFC does not define a discovery handshake — the working-group
-discovery protocol was intentionally left out of the spec. The GUI's Search
-button therefore talks to a :class:`Discovery` backend chosen at construction
-time, decoupled from the wire protocol.
-
-Two backends ship:
-
-* :class:`SsdpDiscovery` — the GUI default. It finds devices with a standard
-  **SSDP/UPnP M-SEARCH** probe (multicast ``239.255.255.250:1900``), then reads
-  each responder's UPnP description over HTTP and lists those that advertise a
-  ``<friendlyName>``. SSDP is a separate, standard protocol — using it here adds
-  no discovery requirement to the pulseUDP RFC; it only locates a host's IP,
-  which the client then addresses on the telemetry port like any typed-in IP.
-* :class:`NullDiscovery` — a no-op backend that finds nothing, for environments
-  with no SSDP responders (or where multicast is undesirable).
-"""
+"""Pluggable device discovery; design in docs/gui-design.md (Discovery)."""
 
 from __future__ import annotations
 
@@ -28,45 +11,31 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-# Standard SSDP multicast endpoint (UPnP Device Architecture, RFC-independent).
 SSDP_ADDR = "239.255.255.250"
 SSDP_PORT = 1900
 
 
 @dataclass
 class Device:
-    """A discovered server the user can pick from the list."""
-
     name: str
     address: str        # IPv4 string the IP field is filled with
 
 
 class Discovery:
-    """Discovery backend interface."""
-
     def search(self, timeout: float = 1.0) -> List[Device]:
         """Return the servers found within ``timeout`` seconds."""
         raise NotImplementedError
 
 
 class NullDiscovery(Discovery):
-    """Backend that finds nothing (no SSDP probe is sent)."""
-
     def search(self, timeout: float = 1.0) -> List[Device]:
         return []
 
 
-# -- SSDP response parsing (pure helpers, no I/O — unit-tested directly) -------
+# Pure helpers, unit-tested directly.
 
 def parse_ssdp_headers(data: bytes) -> Optional[Dict[str, str]]:
-    """Parse an SSDP datagram into a lower-cased header dict.
-
-    Accepts both M-SEARCH replies (``HTTP/1.1 200 OK``) and ``NOTIFY``
-    advertisements; returns ``None`` for anything that is not one of those, so
-    stray datagrams on the multicast group are ignored. The start line is
-    dropped — callers key off headers (``location``, ``usn``, ``server``,
-    ``nts``).
-    """
+    """Lower-cased headers of an M-SEARCH reply or NOTIFY; None for anything else."""
     try:
         text = data.decode("utf-8", "replace")
     except Exception:  # noqa: BLE001 - defensive: any decode failure → ignore
@@ -88,12 +57,7 @@ def parse_ssdp_headers(data: bytes) -> Optional[Dict[str, str]]:
 
 
 def extract_friendly_name(raw) -> Optional[str]:
-    """Pull ``<friendlyName>`` out of a UPnP device-description XML.
-
-    Namespace-agnostic (UPnP descriptions live in the ``urn:schemas-upnp-org``
-    namespace, so a literal tag match would miss them); falls back to a regex if
-    the XML does not parse. Returns ``None`` when no non-empty name is present.
-    """
+    """Namespace-agnostic ``<friendlyName>`` lookup with a regex fallback; None if empty."""
     text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
     try:
         root = ET.fromstring(text)
@@ -114,29 +78,16 @@ def extract_friendly_name(raw) -> Optional[str]:
 
 
 class SsdpDiscovery(Discovery):
-    """Find devices via an SSDP/UPnP M-SEARCH probe on every local interface.
-
-    A multi-homed host (common on Windows) is probed on each IPv4 interface, so
-    devices on secondary subnets are not missed. The probe is sent, replies and
-    ``ssdp:alive`` notifications are collected for ``timeout`` seconds, and each
-    unique ``LOCATION`` is fetched over HTTP for its ``<friendlyName>``. **Only
-    devices that yield a friendly name are listed** — a responder without a
-    readable description is dropped rather than shown as an opaque address.
-
-    ``ifaddr`` is required for per-interface enumeration; a clear error is raised
-    if it is missing (it ships in the ``gui`` extra).
-    """
+    """M-SEARCH on every IPv4 interface; lists only devices with a friendly name."""
 
     def __init__(self, search_target: str = "ssdp:all", mx: int = 2,
                  ttl: int = 2, http_timeout: float = 2.0,
                  on_log: Optional[Callable[[str, str], None]] = None) -> None:
-        self._st = search_target          # broadest target: every responder
+        self._st = search_target
         self._mx = mx                     # server answers within 0..MX seconds
         self._ttl = ttl                   # multicast hop limit
-        self._http_timeout = http_timeout  # per-description HTTP fetch budget
-        self._on_log = on_log             # optional (level, message) sink
-
-    # -- public API -----------------------------------------------------------
+        self._http_timeout = http_timeout  # per description fetch
+        self._on_log = on_log             # (level, message)
 
     def search(self, timeout: float = 3.0) -> List[Device]:
         socks = self._open_sockets()
@@ -156,13 +107,11 @@ class SsdpDiscovery(Discovery):
         self._log("info", "SSDP: {} device(s) with a description.".format(len(devices)))
         return devices
 
-    # -- internals ------------------------------------------------------------
-
     @staticmethod
     def _import_ifaddr():
         try:
             import ifaddr
-        except ImportError as exc:  # hard requirement (gui extra)
+        except ImportError as exc:
             raise RuntimeError(
                 "SSDP discovery needs the 'ifaddr' package "
                 "(pip install ifaddr, or install the GUI extra: "
@@ -170,7 +119,6 @@ class SsdpDiscovery(Discovery):
         return ifaddr
 
     def _open_sockets(self) -> List[socket.socket]:
-        """One multicast-sending UDP socket bound to each IPv4 interface."""
         ifaddr = self._import_ifaddr()
         socks: List[socket.socket] = []
         for adapter in ifaddr.get_adapters():
@@ -238,7 +186,7 @@ class SsdpDiscovery(Discovery):
         return responses
 
     def _fetch_friendly_name(self, location: str) -> Optional[str]:
-        import urllib.request          # lazy: only when a LOCATION is fetched
+        import urllib.request
         req = urllib.request.Request(location, headers={"User-Agent": "pulseUDP-client"})
         with urllib.request.urlopen(req, timeout=self._http_timeout) as resp:
             raw = resp.read(65536)      # descriptions are small; cap the read
@@ -249,7 +197,7 @@ class SsdpDiscovery(Discovery):
         """Dedupe responders by LOCATION, fetch each name, drop the nameless."""
         locations: Dict[str, Dict[str, str]] = {}
         for headers, _src_ip in responses:
-            if headers.get("nts") == "ssdp:byebye":   # device leaving, not present
+            if headers.get("nts") == "ssdp:byebye":
                 continue
             loc = headers.get("location")
             if loc:

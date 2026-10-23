@@ -1,9 +1,4 @@
-"""Guard: the schema bundled as package data must not drift from spec/.
-
-``spec/Schema.json`` is the normative source; ``src/pulseudp/data/Schema.json``
-is the copy shipped inside the package so installed/frozen builds can validate
-descriptors. This test fails if the two diverge.
-"""
+"""The package-data schema copy must not drift from the normative spec/Schema.json."""
 
 import json
 from pathlib import Path

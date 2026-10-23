@@ -1,22 +1,4 @@
-"""Plot model and rolling history for the pulseUDP client.
-
-Two pieces:
-
-* :class:`PlotModel` turns a :class:`~pulseudp.protocol.Descriptor` into the set
-  of plot groups the GUI draws (units-grouped numeric plots, one-per-unitless
-  numeric plot, one digital plot per bitfield) and knows how to flatten a
-  decoded packet array into the flat per-trace channels the buffer stores.
-* :class:`RingBuffer` keeps a rolling history of those channels in a fixed,
-  preallocated ring (no per-frame concatenation), alongside a **min/max
-  decimation pyramid** so the GUI can draw an arbitrarily long history at screen
-  resolution. Its window length (number of samples) is user-selectable at
-  runtime; changing it preserves the most recent samples.
-
-The X axis is a synthetic per-sample counter the buffer generates on append —
-the index of each sample in the stream.
-
-Neither piece touches Qt, so both are unit-testable headless.
-"""
+"""Plot grouping and rolling history (Qt-free); design in docs/gui-design.md."""
 
 from __future__ import annotations
 
@@ -31,22 +13,15 @@ import numpy as np
 from .protocol import Descriptor
 
 
-# --- Plot model --------------------------------------------------------------
-
-
 @dataclass
 class Trace:
-    """One drawable line within a plot group."""
-
     key: str          # unique channel key in the RingBuffer
-    label: str        # legend / list label
+    label: str
     is_bit: bool = False
 
 
 @dataclass
 class PlotGroup:
-    """A single plot widget's worth of traces."""
-
     title: str
     units: Optional[str]
     kind: str                       # "numeric" | "bitfield"
@@ -54,17 +29,7 @@ class PlotGroup:
 
 
 class PlotModel:
-    """Maps a descriptor to plot groups and flattens decoded packets to traces.
-
-    Grouping rules (see docs/gui-design.md):
-
-    * numeric fields that share a ``units`` string → one plot per distinct unit;
-    * numeric fields with no ``units`` → one plot each;
-    * each ``bitfield`` → its own digital plot, one trace per non-``Reserved`` bit.
-
-    Every field is plotted; the X axis is a synthetic per-sample counter the
-    :class:`RingBuffer` generates.
-    """
+    """Maps a descriptor to plot groups (rules: docs/gui-design.md, Grouping)."""
 
     def __init__(self, descriptor: Descriptor) -> None:
         self.descriptor = descriptor
@@ -90,7 +55,7 @@ class PlotModel:
                     self.groups.append(grp)
                 grp.traces.append(Trace(key=f.name, label=f.name))
                 self._channel_keys.append(f.name)
-            else:  # unitless numeric -> its own plot
+            else:
                 grp = PlotGroup(title=f.name, units=None, kind="numeric")
                 grp.traces.append(Trace(key=f.name, label=f.name))
                 self.groups.append(grp)
@@ -102,21 +67,11 @@ class PlotModel:
         return list(self._channel_keys)
 
     def extract(self, packets: np.ndarray) -> Tuple[int, Dict[str, np.ndarray]]:
-        """Flatten a decoded packet array into (n_samples, {trace_key: values})."""
         return self.flatten(self.descriptor.channels(packets))
 
     def flatten(self, channels: Dict[str, np.ndarray]
                 ) -> Tuple[int, Dict[str, np.ndarray]]:
-        """Map per-field channel arrays to (n_samples, {trace_key: values}).
-
-        ``channels`` is :meth:`Descriptor.channels` output — physical-unit arrays
-        keyed by field name, possibly covering only a v2.0 *enabled* subset.
-        Bitfields are expanded into 0/1 bit traces. Fields absent from
-        ``channels`` (disabled channels) are skipped — the RingBuffer fills their
-        keys with NaN, so they draw as gaps. ``n_samples`` is the packet count
-        (the length of every channel array), or 0 if ``channels`` is empty; the
-        RingBuffer generates the per-sample X index from it.
-        """
+        """Map :meth:`Descriptor.channels` output to (n_samples, {trace_key: values})."""
         n = 0
         flat: Dict[str, np.ndarray] = {}
         for f in self.descriptor.plot_fields:
@@ -132,30 +87,17 @@ class PlotModel:
         return n, flat
 
 
-# --- Rolling history ---------------------------------------------------------
-
-# Pyramid decimation factor: each level summarises PYRAMID_FACTOR buckets of the
-# level below into one (min, max) pair. 8 keeps the level count low (a level per
-# ~3 binary octaves) while bounding the per-level memory overhead to ~1/7 of the
-# raw store. MAX_LEVELS caps the pyramid height for tiny windows.
+# Pyramid factor and height cap; rationale in docs/gui-design.md.
 PYRAMID_FACTOR = 8
 MAX_LEVELS = 12
 
-# Raw samples and pyramid buckets are stored as float32: plotting precision only
-# needs ~7 digits and it halves the footprint of a large history. The X axis is
-# never stored — it is the integer sample index, regenerated as float64 on read
-# (float32 cannot represent sample indices past 2**24 exactly).
+# float32 halves the footprint; X is never stored, it is regenerated as float64.
 _STORE_DTYPE = np.float32
 
 
 @dataclass
 class DecimatedView:
-    """A screen-resolution slice of the history for one redraw.
-
-    ``x`` are sample indices (bucket centres when decimated). When ``exact`` is
-    True the view is raw samples and ``ymin``/``ymax`` are the same array per
-    channel; otherwise each channel carries the per-bucket min/max envelope.
-    """
+    """One redraw's slice: raw samples if ``exact``, else per-bucket min/max at bucket centres."""
 
     exact: bool
     x: np.ndarray
@@ -176,35 +118,13 @@ def _nanmax(a: np.ndarray, axis: int) -> np.ndarray:
 
 
 class RingBuffer:
-    """Thread-safe rolling history of a fixed set of channels, with a pyramid.
-
-    The X axis is a synthetic per-sample counter: every appended sample gets the
-    next integer index in the stream, so the X value of a sample is its ordinal
-    position since the last :meth:`clear`. A dropped datagram (silently in v1.0,
-    logged via ``seq_gap`` in v2.0) just means the index skips the lost samples
-    without a visible gap.
-
-    Storage is a fixed, preallocated channel-major ring of shape
-    ``(n_channels, capacity)`` plus a **min/max decimation pyramid**: level *L*
-    keeps one (min, max) pair per ``PYRAMID_FACTOR**L`` raw samples. The pyramid
-    is updated incrementally on :meth:`append` (amortised O(1) per sample) and is
-    only *queried* by :meth:`view` — zooming and resizing pick a level and slice
-    it, they never recompute from the full history. Render cost is therefore
-    bounded by the pixel width of the plot, not the length of the history, so the
-    buffer scales to a multi-GiB window. See ``docs/gui-design.md``.
-
-    ``capacity`` is the requested ``window_n`` rounded up to a whole number of
-    coarsest-level buckets; :meth:`snapshot` and :meth:`view` only ever expose the
-    most recent ``window_n`` samples, so the rounding never leaks older data.
-    """
+    """Thread-safe ring + min/max pyramid; docs/gui-design.md (Rendering pipeline)."""
 
     def __init__(self, channel_keys: List[str], window_n: int) -> None:
         self._keys = list(channel_keys)
         self._C = len(self._keys)
         self._lock = threading.Lock()
         self._allocate(int(window_n))
-
-    # -- allocation / planning ------------------------------------------------
 
     @staticmethod
     def _plan(window_n: int) -> Tuple[int, int]:
@@ -213,7 +133,7 @@ class RingBuffer:
         # Tallest pyramid whose coarsest bucket still spans <= the window.
         levels = max(1, min(MAX_LEVELS, int(math.floor(math.log(w, PYRAMID_FACTOR)))))
         coarsest = PYRAMID_FACTOR ** levels
-        capacity = ((w + coarsest - 1) // coarsest) * coarsest   # multiple of coarsest
+        capacity = ((w + coarsest - 1) // coarsest) * coarsest
         return capacity, levels
 
     @staticmethod
@@ -221,7 +141,7 @@ class RingBuffer:
         """Bytes this buffer would allocate for ``window_n`` (raw + pyramid)."""
         cap, levels = RingBuffer._plan(window_n)
         itemsize = np.dtype(_STORE_DTYPE).itemsize
-        total = n_channels * cap * itemsize                      # raw ring
+        total = n_channels * cap * itemsize
         for L in range(1, levels + 1):
             cap_l = cap // (PYRAMID_FACTOR ** L)
             total += 2 * n_channels * cap_l * itemsize           # min + max per level
@@ -253,8 +173,6 @@ class RingBuffer:
     def capacity(self) -> int:
         return self._cap
 
-    # -- ring position helpers ------------------------------------------------
-
     def _store(self, level: int) -> Tuple[np.ndarray, np.ndarray, int]:
         """Return (min_array, max_array, capacity) for a level (raw is level 0)."""
         if level == 0:
@@ -269,7 +187,7 @@ class RingBuffer:
         start = lo % cap_l
         end = start + count
         if end <= cap_l:
-            return np.array(arr[:, start:end])                   # contiguous copy
+            return np.array(arr[:, start:end])
         k = cap_l - start
         out = np.empty((self._C, count), dtype=arr.dtype)
         out[:, :k] = arr[:, start:cap_l]
@@ -303,9 +221,8 @@ class RingBuffer:
                       _nanmax(child_mx.reshape(self._C, count, F), axis=2))
 
     def _build_incremental(self) -> None:
-        """Fold newly appended samples into every pyramid level (ascending)."""
         for L in range(1, self._levels + 1):
-            avail = self._n_total // (PYRAMID_FACTOR ** L)       # complete buckets now
+            avail = self._n_total // (PYRAMID_FACTOR ** L)
             if avail > self._built[L]:
                 self._fill_level(L, self._built[L], avail)
                 self._built[L] = avail
@@ -322,16 +239,8 @@ class RingBuffer:
             self._built[L] = b_hi
             child_first = b_lo
 
-    # -- public API -----------------------------------------------------------
-
     def set_window(self, window_n: int) -> None:
-        """Change the retained window length, preserving the most recent samples.
-
-        Reallocates the ring/pyramid to the new size and copies the retained tail
-        back at its original sample indices (so the X axis is continuous), then
-        rebuilds the pyramid over it. This is an O(retained) one-shot on a user
-        action, not a per-frame cost.
-        """
+        """Change the window length, keeping the latest samples at their original indices."""
         with self._lock:
             new_w = int(window_n)
             new_cap, _ = self._plan(new_w)
@@ -343,7 +252,7 @@ class RingBuffer:
             self._allocate(new_w)                                    # resets to empty
             if keep:
                 self._n_total = lo
-                self._scatter(0, "mn", lo, hi, tail)                 # restore at [lo,hi)
+                self._scatter(0, "mn", lo, hi, tail)
                 self._n_total = hi
                 self._rebuild(lo, hi)
 
@@ -353,11 +262,7 @@ class RingBuffer:
             self._built = [0] * (self._levels + 1)
 
     def append(self, n: int, channels: Dict[str, np.ndarray]) -> None:
-        """Append ``n`` samples, assigning them the next ``n`` X indices.
-
-        ``channels`` maps trace keys to length-``n`` arrays; keys absent from it
-        (disabled v2.0 channels) are filled with NaN so they draw as gaps.
-        """
+        """Append ``n`` samples at the next X indices; absent keys are stored as NaN."""
         if n <= 0:
             return
         with self._lock:
@@ -378,15 +283,10 @@ class RingBuffer:
             return self._n_total - 1 if self._n_total else None
 
     def _resident_lo_locked(self) -> int:
-        """Oldest sample index currently exposed (logical window, lock held)."""
         return max(0, self._n_total - self._window_n)
 
     def snapshot(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """Return a copy of the full retained window: (x_index, channels).
-
-        Kept for headless use/tests; the GUI redraw uses :meth:`view` instead so
-        it never copies the whole window per frame.
-        """
+        """Copy of the full window (tests); the GUI uses :meth:`view`."""
         with self._lock:
             if self._n_total == 0:
                 empty = np.empty(0, dtype=np.float64)
@@ -399,13 +299,7 @@ class RingBuffer:
             return x, chans
 
     def view(self, x0: float, x1: float, max_points: int) -> Optional[DecimatedView]:
-        """Decimated slice of [x0, x1] for ~``max_points`` pixels.
-
-        Picks the coarsest pyramid level whose bucket is <= one pixel wide and
-        returns its min/max envelope over the visible range; falls back to exact
-        raw samples when zoomed in far enough (or when no complete bucket covers
-        the range). Returns None when there is nothing resident to draw.
-        """
+        """Decimated slice of [x0, x1] for ~``max_points`` pixels; None if nothing resident."""
         with self._lock:
             if self._n_total == 0:
                 return None

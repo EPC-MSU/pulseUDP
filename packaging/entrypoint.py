@@ -1,10 +1,4 @@
-"""Frozen-app entry point for PyInstaller builds.
-
-PyInstaller runs the spec's top-level script as ``__main__`` with no parent
-package, so it cannot be the package's own ``__main__.py`` (which uses the
-relative ``from .app import run``). This launcher uses an absolute import
-against the bundled ``pulseudp`` package instead. See packaging/pulseudp.spec.
-"""
+"""PyInstaller entry point: an absolute import, since a frozen ``__main__`` has no parent package."""
 
 import sys
 

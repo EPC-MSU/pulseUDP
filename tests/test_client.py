@@ -1,9 +1,4 @@
-"""Tests for UdpClient v1.0 / v2.0 behavior (no sockets, no Qt).
-
-Covers the version-dependent wire rules: outbound framing (sequence + CRC) and
-inbound validation (CRC check, sequence-loss detection), exercising the receiver
-logic directly via ``_handle_datagram`` / ``_send`` without touching the network.
-"""
+"""UdpClient per-version wire rules, driven via ``_handle_datagram`` / ``_send`` (no sockets, no Qt)."""
 
 import json
 import struct
@@ -15,8 +10,7 @@ from pulseudp.client import PROBE_VERSION, UdpClient
 from pulseudp.protocol import (Descriptor, Header, MessageType, crc16_ccitt,
                                encode_channel_bitmap)
 
-# Minimal structurally-valid descriptor for the negotiation tests (schema=None,
-# so it is parsed but not schema-validated).
+# Parsed but not schema-validated (schema=None).
 _DESC_JSON = json.dumps({
     "version": "1.0.0",
     "fields": [
@@ -49,8 +43,6 @@ class _FakeSock:
         self.sent.append((data, addr))
 
 
-# -- inbound: CRC validation --------------------------------------------------
-
 def test_v1_good_crc_is_accepted():
     c = UdpClient("127.0.0.1", version=(2, 0))
     c._handle_datagram(_datagram(MessageType.STOP, 0, (2, 0)))
@@ -74,11 +66,8 @@ def test_v01_crc_field_is_ignored():
     assert events == []
 
 
-# -- inbound: payload alignment (RFC §3) --------------------------------------
-
 def test_non_word_aligned_payload_warns_but_is_tolerated():
-    # RFC §3: Payload length MUST be 32-bit word aligned. A violation is
-    # flagged ('align') yet still processed — the client stays tolerant.
+    # RFC §3 violation is flagged ('align') yet still processed.
     events = []
     c = UdpClient("127.0.0.1", version=(2, 0), on_log=lambda e: events.append(e))
     c._handle_datagram(_datagram(MessageType.STOP, 0, (2, 0), payload=b"abc"))
@@ -93,8 +82,6 @@ def test_word_aligned_payload_is_silent():
     assert c._stop_ack.is_set()
     assert events == []                         # 4 B is word-aligned, no warning
 
-
-# -- inbound: sequence-loss detection -----------------------------------------
 
 def test_v1_telemetry_sequence_gap_logs():
     events = []
@@ -114,8 +101,6 @@ def test_v01_telemetry_sequence_gap_is_silent():
     c._handle_datagram(_datagram(MessageType.TELEMETRY, 99, (1, 0)))
     assert events == []
 
-
-# -- outbound: framing per version --------------------------------------------
 
 def test_send_v1_stamps_sequence_and_valid_crc():
     c = UdpClient("127.0.0.1", version=(2, 0))
@@ -145,16 +130,13 @@ def test_send_v01_zeroes_sequence_and_crc():
         assert int.from_bytes(data[-2:], "little") == 0   # CRC sent as zero
 
 
-# -- multi-datagram reassembly (RFC §5.6, v2.0) -------------------------------
-
 def _split(message, pieces):
     """Chop a contiguous message into ``pieces`` datagram-sized parts (RFC §5.6)."""
     size = (len(message) + pieces - 1) // pieces
     return [message[i:i + size] for i in range(0, len(message), size)]
 
 
-# A payload too big for one datagram; the first piece carries the header, the
-# rest are headerless continuation bytes.
+# Too big for one datagram.
 _BIG_PAYLOAD = b"D" * 3000
 
 
@@ -213,22 +195,15 @@ def test_multidatagram_timeout_discards_then_recovers():
 
 
 def test_v01_never_reassembles():
-    # v1.0 has no multi-datagram support: a short datagram is just a short
-    # datagram, never the start of a reassembly.
+    # v1.0: a short datagram never starts a reassembly.
     c = UdpClient("127.0.0.1", version=(1, 0))
     msg = _datagram(MessageType.DESCRIPTION, 0, (1, 0), payload=_BIG_PAYLOAD)
     c._handle_datagram(_split(msg, 3)[0])                   # only the first piece
     assert c._reasm is None                                 # no reassembly state
 
 
-# -- channel selection (RFC §4, v2.0) -----------------------------------------
-
 def _channel_client(reply_enabled, version=(2, 0)):
-    """A v2.0 client whose ``_send`` answers GET/SET_CHANNELS with a canned bitmap.
-
-    The descriptor is the 2-field ``_DESC_JSON`` (Timestamp, V), so a reply of
-    ``[True, False]`` enables only the first channel.
-    """
+    """A client whose ``_send`` answers GET/SET_CHANNELS with ``reply_enabled`` (2-field descriptor)."""
     c = UdpClient("127.0.0.1", version=version)
     c._sock = _FakeSock()
     c.version = version
@@ -275,15 +250,8 @@ def test_v01_channels_are_immutable_and_offline():
     assert c._sock.sent == []                        # nothing put on the wire
 
 
-# -- version negotiation (RFC §6.1) -------------------------------------------
-
 def _client_replying(reply_version, probe_log=None):
-    """A client whose ``_send`` answers each DESCRIPTION with a canned reply.
-
-    Models a reachable server that stamps its reply with ``reply_version``
-    regardless of the probe's version. ``probe_log`` (if given) records the
-    version the client was framing each request at, to assert the probe is v2.0.
-    """
+    """A server replying at ``reply_version`` to any probe; ``probe_log`` records probe versions."""
     c = UdpClient("127.0.0.1")
     c._sock = _FakeSock()
 

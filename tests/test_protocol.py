@@ -31,8 +31,7 @@ def _pack(ts, va, cur, flags, counter):
 
 
 def test_from_json_strips_nul_terminator_and_word_padding():
-    # Wire form (RFC §5.1): NUL-terminated UTF-8, padded to a 32-bit word.
-    # Non-zero padding proves the reader stops at the first NUL.
+    # Non-zero padding proves the reader stops at the first NUL (RFC §5.1).
     body = json.dumps(EXAMPLE).encode("utf-8") + b"\x00"
     framed = body + b"\xff" * ((-len(body)) % 4)
     assert len(framed) % 4 == 0                 # word-aligned payload (RFC §3)

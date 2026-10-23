@@ -1,13 +1,4 @@
-"""UDP client for the pulseUDP protocol.
-
-:class:`UdpClient` owns the socket and a single receiver thread that reads every
-inbound datagram for the session. It exposes the three transactions from RFC §4
-— ``DESCRIPTION``, ``TELEMETRY`` (start), ``STOP`` — each with a retransmit
-timeout (every request must produce a response). Decoded telemetry and protocol
-log events are delivered through plain callables, so this module has no Qt
-dependency and can be driven headless (e.g. against ``tools/sim.py``). The GUI
-wraps the callbacks in Qt signals to marshal them onto the main thread.
-"""
+"""Qt-free pulseUDP client: socket, receiver thread and RFC §4 transactions."""
 
 from __future__ import annotations
 
@@ -26,9 +17,7 @@ from .protocol import (HEADER_SIZE, TRAILER_SIZE, WORD_BYTES, Descriptor,
                        encode_channel_bitmap)
 
 DEFAULT_PORT = 2102
-#: Protocol versions this client understands, highest first. The first entry is
-#: the version used for the opening DESCRIPTION probe; the session then adopts
-#: whatever version the server reveals in its reply (RFC §6.1).
+#: Highest first; the first is the DESCRIPTION probe version (RFC §6.1).
 SUPPORTED_VERSIONS = ((2, 0), (1, 0))
 PROBE_VERSION = SUPPORTED_VERSIONS[0]
 _RECV_BUFSIZE = 65535
@@ -38,14 +27,13 @@ _REASM_TIMEOUT = 0.3   # s, multi-datagram reassembly deadline (RFC §5.6)
 
 @dataclass
 class LogEvent:
-    """A protocol-level event for the log panel. The consumer adds the wall clock."""
+    """The consumer adds the wall clock."""
 
     category: str    # bad_magic | bad_version | short | align | decode | seq_gap | crc | reasm | info | error
     message: str
     level: str = "warning"   # info | warning | error
 
 
-# Callback type aliases (documentation only).
 TelemetryCb = Callable[[Dict[str, np.ndarray]], None]  # per-field physical arrays
 LogCb = Callable[[LogEvent], None]
 StateCb = Callable[[str, str], None]          # (state, detail)
@@ -53,43 +41,16 @@ StateCb = Callable[[str, str], None]          # (state, detail)
 
 @dataclass
 class _Reassembly:
-    """In-progress multi-datagram message (v2.0, RFC §5.6).
-
-    Only the first datagram carries the header; the rest are raw continuation
-    bytes appended to ``buf`` until it reaches ``expected`` total bytes
-    (``HEADER_SIZE + payload_length + TRAILER_SIZE``).
-    """
+    """In-progress multi-datagram message (RFC §5.6); only the first piece has a header."""
 
     header: Header
     expected: int
-    deadline: float       # time.monotonic() past which the partial buffer is dropped
+    deadline: float       # time.monotonic()
     buf: bytearray
 
 
 class UdpClient:
-    """A single-server pulseUDP client.
-
-    Parameters
-    ----------
-    host, port:
-        Server address. ``port`` defaults to the protocol port 2102.
-    version:
-        The version used for the opening ``DESCRIPTION`` **probe**, ``(major,
-        minor)`` — the highest supported (v2.0) by default. The session version
-        is then *discovered*: :meth:`request_descriptor` reads the server's
-        version from its reply and fixates ``self.version`` to it (RFC §6.1), so
-        all later requests are framed at the negotiated version. v2.0 stamps an
-        active sequence number + real CRC-16 (RFC §3.2); v1.0 sends both as zero.
-        Inbound validation always keys off each datagram's own version field.
-    schema:
-        Optional descriptor JSON-Schema; when given, descriptors are validated
-        against it before use.
-    on_telemetry, on_log, on_state:
-        Callbacks. ``on_telemetry`` is invoked from the receiver thread with a
-        dict of per-field physical-unit arrays (``{field_name: ndarray}``) for
-        the enabled channels; keep it cheap and thread-safe (the GUI flattens it
-        and appends to a thread-safe ``RingBuffer``).
-    """
+    """Single-server client; callbacks run on the receiver thread (docs/gui-design.md)."""
 
     def __init__(self, host: str, port: int = DEFAULT_PORT,
                  version: Tuple[int, int] = PROBE_VERSION,
@@ -106,9 +67,7 @@ class UdpClient:
         self._on_state = on_state
 
         self.descriptor: Optional[Descriptor] = None
-        # v2.0 channel selection (RFC §4): which descriptor channels are enabled,
-        # and the descriptor used to decode telemetry — the full descriptor, or a
-        # subset matching the enabled channels' on-wire packet layout.
+        # The active descriptor matches the enabled channels' wire layout (RFC §4).
         self.enabled_channels: Optional[List[bool]] = None
         self._active_descriptor: Optional[Descriptor] = None
 
@@ -116,12 +75,9 @@ class UdpClient:
         self._rx_thread: Optional[threading.Thread] = None
         self._closing = threading.Event()
 
-        # Response routing from the receiver thread to waiting callers.
-        # DESCRIPTION carries (reply_version, payload) so the caller can fixate
-        # the negotiated protocol version (RFC §6.1).
+        # (reply_version, payload): the reply's version is the negotiated one.
         self._desc_q: "queue.Queue[Tuple[Tuple[int, int], bytes]]" = queue.Queue()
-        # GET_CHANNELS / SET_CHANNELS responses both carry a channel bitmap (RFC §4);
-        # the two are serialized request/response transactions, so one queue serves.
+        # GET_ and SET_CHANNELS are serialized, so they share one queue.
         self._chan_q: "queue.Queue[bytes]" = queue.Queue()
         self._stop_ack = threading.Event()
         self._stream_started = threading.Event()
@@ -131,10 +87,7 @@ class UdpClient:
         self._tx_seq = 0                        # next TX sequence (v2.0 outbound)
         self._reasm: Optional[_Reassembly] = None  # multi-datagram in progress
 
-    # -- lifecycle ------------------------------------------------------------
-
     def open(self) -> None:
-        """Open the socket and start the receiver thread."""
         if self._sock is not None:
             return
         self._closing.clear()
@@ -149,7 +102,6 @@ class UdpClient:
         self._rx_thread.start()
 
     def close(self) -> None:
-        """Stop streaming if needed, stop the receiver thread, close the socket."""
         self._closing.set()
         if self._rx_thread is not None:
             self._rx_thread.join(timeout=1.0)
@@ -162,25 +114,11 @@ class UdpClient:
         self._streaming = False
         self._emit_state("disconnected", "")
 
-    # -- transactions ---------------------------------------------------------
-
     def request_descriptor(self, timeout: float = 1.0, retries: int = 3) -> Descriptor:
-        """Probe with ``DESCRIPTION``, negotiate the version, return the descriptor.
-
-        Sends the opening ``DESCRIPTION`` framed at the probe version (highest
-        supported), then fixates :attr:`version` to whatever the server
-        reveals in its reply and uses that for the rest of the session (RFC
-        §6.1). A reply in an unsupported version raises ``RuntimeError``; no
-        reply within the retransmit budget raises ``TimeoutError`` (the endpoint
-        is unreachable — version is never the cause, since any server
-        answers any request).
-        """
+        """Negotiate the version (RFC §6.1); RuntimeError if unsupported, TimeoutError if no reply."""
         self._require_open()
         self._emit_state("connecting", "{}:{}".format(self.host, self.port))
-        # Probe at the highest supported version; the server answers
-        # regardless of version and the reply reveals its own (RFC §6.1).
         self.version = PROBE_VERSION
-        # Drain any stale reply.
         self._drain(self._desc_q)
         for attempt in range(retries):
             self._send(MessageType.DESCRIPTION)
@@ -202,8 +140,7 @@ class UdpClient:
             descriptor = Descriptor.from_json(
                 payload, schema=self.schema, validate=self.schema is not None)
             self.descriptor = descriptor
-            # Start with every channel enabled (v1.0 immutable; v2.0 until the
-            # caller narrows it via set_channels). Decode against the full layout.
+            # All enabled until a v2.0 caller narrows it.
             self._set_active([True] * len(descriptor.fields))
             self._emit_state("connected",
                              "protocol v{}.{} · descriptor v{} · {} fields".format(
@@ -244,14 +181,8 @@ class UdpClient:
         self._streaming = False
         self._emit_state("stopped", "")
 
-    # -- channel selection (v2.0, RFC §4) -------------------------------------
-
     def get_channels(self, timeout: float = 1.0, retries: int = 3) -> List[bool]:
-        """Read the enabled-channel set (RFC §4), one bool per descriptor field.
-
-        v1.0 has no selection — every channel is enabled and immutable, so this
-        returns all-``True`` without touching the wire.
-        """
+        """One bool per descriptor field (RFC §4); all True under v1.0."""
         self._require_open()
         if self.descriptor is None:
             raise RuntimeError("request the descriptor before reading channels")
@@ -275,12 +206,7 @@ class UdpClient:
 
     def set_channels(self, enabled, timeout: float = 1.0,
                      retries: int = 3) -> List[bool]:
-        """Request an enabled-channel set; return the set the server accepted.
-
-        The server may refuse or alter the request (RFC §4), so the returned list
-        — not the requested one — is authoritative and becomes the decode layout.
-        v1.0 has no selection: returns all-``True`` and sends nothing.
-        """
+        """Returns the set the server accepted, which is authoritative (RFC §4)."""
         self._require_open()
         if self.descriptor is None:
             raise RuntimeError("request the descriptor before setting channels")
@@ -304,11 +230,6 @@ class UdpClient:
         raise TimeoutError("no SET_CHANNELS response after {} attempts".format(retries))
 
     def _set_active(self, enabled: List[bool]) -> None:
-        """Record the enabled set and the descriptor used to decode telemetry.
-
-        With every channel enabled the full descriptor is used; otherwise a
-        :meth:`Descriptor.subset` matching the enabled channels' packet layout.
-        """
         self.enabled_channels = list(enabled)
         if self.descriptor is None or all(enabled):
             self._active_descriptor = self.descriptor
@@ -317,8 +238,6 @@ class UdpClient:
             self._active_descriptor = (self.descriptor.subset(idx) if idx
                                        else self.descriptor)
 
-    # -- receiver thread ------------------------------------------------------
-
     def _rx_loop(self) -> None:
         sock = self._sock
         assert sock is not None
@@ -326,8 +245,7 @@ class UdpClient:
             try:
                 data, _addr = sock.recvfrom(_RECV_BUFSIZE)
             except socket.timeout:
-                # Idle wakeup: also a chance to time out a stalled reassembly even
-                # when no further datagrams arrive (RFC §5.6).
+                # Expire a stalled reassembly even when nothing more arrives.
                 self._expire_reassembly()
                 continue
             except OSError:
@@ -335,9 +253,7 @@ class UdpClient:
             self._handle_datagram(data)
 
     def _handle_datagram(self, data: bytes) -> None:
-        # A multi-datagram message in progress (v2.0, RFC §5.6): every datagram
-        # after the first is raw continuation bytes — no header, no magic — so it
-        # must not be parsed as a header. Append it and try to complete.
+        # Continuation pieces carry no header (RFC §5.6).
         self._expire_reassembly()
         if self._reasm is not None:
             self._feed_reassembly(data)
@@ -358,9 +274,7 @@ class UdpClient:
                       "unsupported version {}.{}".format(*header.version))
             return
 
-        # Length-delimited reassembly (RFC §5.6, v2.0 only): a first datagram that
-        # carries fewer bytes than its header declares (12 + payload_length + 4)
-        # opens a multi-datagram message; the remaining pieces arrive headerless.
+        # Shorter than declared: a v2.0 multi-datagram message starts (RFC §5.6).
         expected = HEADER_SIZE + header.payload_length + TRAILER_SIZE
         if header.version[0] >= 2 and len(data) < expected:
             self._reasm = _Reassembly(
@@ -372,15 +286,13 @@ class UdpClient:
         self._process_message(header, data)
 
     def _feed_reassembly(self, data: bytes) -> None:
-        """Append a continuation datagram; process the message once it's complete."""
         r = self._reasm
         assert r is not None
         r.buf += data
         if len(r.buf) < r.expected:
-            return                          # still waiting for more pieces
+            return
         if len(r.buf) > r.expected:
-            # Over-run: a lost/reordered/duplicated piece corrupted the stream.
-            # All-or-nothing (RFC §5.6) — drop and let the caller re-request.
+            # A lost/reordered/duplicated piece; all-or-nothing (RFC §5.6).
             self._log("reasm", "warning",
                       "reassembled {} B exceeds expected {} B; message dropped".format(
                           len(r.buf), r.expected))
@@ -391,7 +303,6 @@ class UdpClient:
         self._process_message(header, message)
 
     def _expire_reassembly(self) -> None:
-        """Discard a partial multi-datagram buffer past its deadline (RFC §5.6)."""
         r = self._reasm
         if r is not None and time.monotonic() > r.deadline:
             self._log("reasm", "warning",
@@ -400,33 +311,17 @@ class UdpClient:
             self._reasm = None
 
     def _process_message(self, header: Header, data: bytes) -> None:
-        """Handle one complete message: ``data`` is header ‖ payload ‖ trailer.
-
-        Called for single-datagram messages and for the reassembled bytes of a
-        multi-datagram one alike, so the CRC covers the whole message either way.
-        """
-        # CRC and sequence are v2.0 concerns: in v1.0 both fields are sent as 0
-        # and ignored, so neither is checked. Each message is judged by its own
-        # version field, so the client handles a mixed/either-version server.
+        """``data`` is header ‖ payload ‖ trailer, single-datagram or reassembled."""
         if header.version[0] >= 2:
-            # Validate the trailer CRC-16/CCITT-FALSE (RFC §3.2) before trusting
-            # anything else; a bad CRC means the header (and its sequence number)
-            # is unreliable, so drop without updating seq state. For a reassembled
-            # message this covers the entire reassembled message (RFC §5.6).
+            # Before anything else: a bad CRC makes the sequence number untrustworthy.
             if not self._crc_ok(data):
                 self._log("crc", "warning",
                           "CRC mismatch (type 0x{:04x}); message dropped".format(
                               header.message_type))
                 return
-            # Sequence-loss detection runs on the telemetry stream only.
             if header.message_type == MessageType.TELEMETRY:
                 self._check_sequence(header.sequence)
 
-        # RFC §3: Payload length MUST be a whole number of 32-bit words. A
-        # violation is malformed framing; warn but stay tolerant — decode
-        # whatever is well-formed (whole packets for telemetry; the descriptor
-        # parser stops at the first NUL). Checked after the CRC so a corrupt
-        # header's length never triggers a spurious warning.
         if header.payload_length % WORD_BYTES != 0:
             self._log("align", "warning",
                       "payload length {} B is not 32-bit word aligned (RFC §3); "
@@ -439,11 +334,8 @@ class UdpClient:
         payload = data[HEADER_SIZE:HEADER_SIZE + n_payload]
 
         if mtype == MessageType.DESCRIPTION:
-            # Forward the reply's version so the caller can fixate it (RFC §6.1).
             self._desc_q.put((header.version, payload))
         elif mtype in (MessageType.GET_CHANNELS, MessageType.SET_CHANNELS):
-            # Both responses carry the channel bitmap (RFC §4); hand it to the
-            # waiting get_channels/set_channels caller.
             self._chan_q.put(payload)
         elif mtype == MessageType.STOP:
             self._stop_ack.set()
@@ -456,17 +348,13 @@ class UdpClient:
                       "unknown message type 0x{:04x}".format(mtype))
 
     def _dispatch_telemetry(self, payload: bytes) -> None:
-        # Decode against the *active* descriptor: the full layout, or a subset
-        # matching the v2.0 enabled channels (RFC §4) — the packet on the wire
-        # carries only the enabled fields.
         dd = self._active_descriptor or self.descriptor
         if dd is None or self._on_telemetry is None:
             return
         if dd.packet_size == 0:
-            return                      # no channels enabled -> nothing to decode
+            return                      # no channels enabled
         if len(payload) % dd.packet_size != 0:
-            # Trailing pad is allowed (RFC §5.3); only flag a non-integer count
-            # that also leaves no whole packets.
+            # Trailing pad is allowed (RFC §5.3).
             if dd.packets_in(len(payload)) == 0:
                 self._log("decode", "warning",
                           "telemetry payload {} B < packet size {} B".format(
@@ -474,13 +362,12 @@ class UdpClient:
                 return
         packets = dd.decode(payload)
         if packets.size:
-            # Deliver per-field physical arrays (only the enabled channels).
             self._on_telemetry(dd.channels(packets))
 
     def _crc_ok(self, data: bytes) -> bool:
-        """True if the trailer CRC-16 matches (RFC §3.2 covers Magic..Reserved)."""
+        """RFC §3.2: the CRC covers Magic..Reserved."""
         if len(data) < HEADER_SIZE + TRAILER_SIZE:
-            return False   # too short to carry a trailer
+            return False
         stored = int.from_bytes(data[-2:], "little")
         return stored == crc16_ccitt(data[:-2])
 
@@ -494,12 +381,8 @@ class UdpClient:
                               expected, seq, gap))
         self._last_seq = seq
 
-    # -- helpers --------------------------------------------------------------
-
     def _send(self, mtype: MessageType, payload: bytes = b"") -> None:
         assert self._sock is not None
-        # v2.0: stamp an active per-message sequence and a real CRC; v1.0 zeroes
-        # both (sent and ignored, RFC §3.1).
         if self.version[0] >= 2:
             seq = self._tx_seq & 0xFFFF
             self._tx_seq = (self._tx_seq + 1) & 0xFFFF
