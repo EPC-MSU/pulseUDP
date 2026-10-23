@@ -51,7 +51,8 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
 ## Library stack
 
 - **PyQt5** — widgets, event loop, `QTimer`, signals/slots.
-- **pyqtgraph** (0.13.x) — `PlotWidget` + custom `ViewBox` for the zoom state machine.
+- **pyqtgraph** (0.13.x) — plots with pyqtgraph's native X-only zoom/pan; the only `ViewBox`
+  subclass (`TelemetryViewBox`) replaces the context menu.
 - **NumPy** — structured-dtype packet decode and ring buffers.
 - **stdlib `socket` + `threading`** — blocking receiver socket in its own thread (not
   `QUdpSocket`, which couples to the GUI event loop and stalls at ~20 kHz).
@@ -61,7 +62,8 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
 - `protocol.py` *(exists; extended)* — header framing, `MessageType`, `TYPE_WORDS`, plus
   `Descriptor` (parse + validate, build decode plan) and the NumPy decoder.
 - `client.py` *(new)* — `UdpClient`: socket lifecycle, `DESCRIPTION`/`TELEMETRY`/`STOP`
-  transactions with retransmit timeout, receiver thread, Qt signals for samples + log events.
+  transactions with retransmit timeout, receiver thread; Qt-free — samples, log events and
+  state changes are plain callbacks, which `app.py` marshals onto the GUI thread via Qt signals.
 - `discovery.py` *(new)* — pluggable `Discovery` interface with two backends: `SsdpDiscovery`
   (the GUI default — an SSDP/UPnP M-SEARCH probe, see [Discovery](#discovery-search-button)) and
   `NullDiscovery` (finds nothing). SSDP is a separate standard protocol, so this keeps the pulseUDP
@@ -265,10 +267,11 @@ Headless units: descriptor → decode-plan correctness, decode round-trip vs `to
 ring-buffer trim-by-sample-window, sequence-gap detection. GUI smoke test optional
 (`pytest-qt`), kept minimal.
 
-## Deferred (unchanged by this design)
+## Implementation status
 
-Selectable telemetry fields (RFC §8). (Device discovery is now implemented via SSDP — see
-[Discovery](#discovery-search-button).)
+Nothing is currently deferred. Device discovery is implemented via SSDP (see
+[Discovery](#discovery-search-button)), and v2.0 channel selection via `GET_CHANNELS` /
+`SET_CHANNELS` (RFC §4, see [UI layout](#ui-layout-single-window-stacked-panels)).
 
 The v2.0 wire path is fully implemented: the CRC is validated (CRC-16/CCITT-FALSE, RFC §3.2)
 and large messages split across several datagrams are reassembled length-delimited (RFC §5.6,
