@@ -236,16 +236,6 @@ class Descriptor:
         return {f.name: packets[dname]
                 for f, dname in zip(self.fields, self._dtype_names)}
 
-    @staticmethod
-    def bit_traces(field: Field, values: np.ndarray) -> Dict[str, np.ndarray]:
-        """One 0/1 array per named bit, LSB first, skipping ``Reserved`` (RFC §5.2)."""
-        traces: Dict[str, np.ndarray] = {}
-        for bit, name in enumerate(field.bits or []):
-            if name == "Reserved":
-                continue
-            traces[name] = ((values >> bit) & 1).astype(np.uint8)
-        return traces
-
     @property
     def plot_fields(self) -> List[Field]:
         """Every field; X is the client's sample counter, not a descriptor field."""

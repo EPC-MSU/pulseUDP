@@ -77,16 +77,6 @@ def test_trailing_pad_is_ignored():
     assert d.decode(payload).size == 1
 
 
-def test_bit_traces_skip_reserved():
-    d = Descriptor.from_json(EXAMPLE)
-    flags = next(f for f in d.fields if f.is_bitfield)
-    values = np.array([0b101, 0b100], dtype=np.uint32)   # Run+Fault, then Fault
-    traces = Descriptor.bit_traces(flags, values)
-    assert set(traces) == {"Run", "Fault"}               # Reserved (bit 1) dropped
-    assert np.array_equal(traces["Run"], [1, 0])
-    assert np.array_equal(traces["Fault"], [1, 1])       # bit 2
-
-
 def test_descriptor_subset_matches_wire_layout():
     # A v2.0 subset packet carries only the enabled fields, packed contiguously.
     d = Descriptor.from_json(EXAMPLE)

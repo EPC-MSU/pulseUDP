@@ -30,6 +30,10 @@ class Column:
     bits: List[Tuple[str, int]] = _dc_field(default_factory=list)   # (trace key, bit)
 
 
+def _bit_key(field_name: str, bit_name: str) -> str:
+    return "{}.{}".format(field_name, bit_name)
+
+
 @dataclass
 class PlotGroup:
     title: str
@@ -47,12 +51,11 @@ class PlotModel:
         self._channel_keys: List[str] = []
 
         self._formats: Dict[str, str] = {}
-        for f in descriptor.fields:
-            if f.is_bitfield:
-                for name in f.bits or []:
-                    self._formats["{}.{}".format(f.name, name)] = "%d"
-            elif f.dtype.kind in "iu" and f.scale is None:
-                self._formats[f.name] = "%d"
+        for col in self.columns():
+            if col.is_bitfield:
+                self._formats.update((key, "%d") for key, _ in col.bits)
+            elif col.dtype.kind in "iu" and col.scale is None:
+                self._formats[col.name] = "%d"
 
         units_group: Dict[str, PlotGroup] = {}
         for f in descriptor.plot_fields:
@@ -61,7 +64,7 @@ class PlotModel:
                 for bit, name in enumerate(f.bits or []):
                     if name == "Reserved":
                         continue
-                    key = "{}.{}".format(f.name, name)
+                    key = _bit_key(f.name, name)
                     grp.traces.append(Trace(key=key, label=name, is_bit=True))
                     self._channel_keys.append(key)
                 self.groups.append(grp)
@@ -91,7 +94,7 @@ class PlotModel:
             if enabled is not None and not (i < len(enabled) and enabled[i]):
                 continue
             if f.is_bitfield:
-                bits = [("{}.{}".format(f.name, name), b)
+                bits = [(_bit_key(f.name, name), b)
                         for b, name in enumerate(f.bits or []) if name != "Reserved"]
                 cols.append(Column(f.name, f.dtype, is_bitfield=True, bits=bits))
             else:
@@ -285,30 +288,16 @@ class RingBuffer:
     def _resident_lo_locked(self) -> int:
         return max(0, self._n_total - self._window_n)
 
-    def _traces(self, lo: List[np.ndarray], hi: Optional[List[np.ndarray]] = None
-                ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-        """Per-column min/max -> per-trace dicts (mult applied, bits split); exact if no ``hi``."""
-        exact = hi is None
-        ymin: Dict[str, np.ndarray] = {}
-        ymax: Dict[str, np.ndarray] = ymin if exact else {}
-        for c, col in enumerate(self._cols):
-            a = lo[c]
-            b = a if exact else hi[c]
+    def _traces(self, arrays: List[np.ndarray]) -> Dict[str, np.ndarray]:
+        """Per-column arrays -> per-trace arrays (mult applied, bits split)."""
+        out: Dict[str, np.ndarray] = {}
+        for col, a in zip(self._cols, arrays):
             if col.is_bitfield:
                 for key, bit in col.bits:
-                    ymin[key] = ((a >> bit) & 1).astype(np.uint8)
-                    if not exact:
-                        ymax[key] = ((b >> bit) & 1).astype(np.uint8)
-                continue
-            if col.scale is not None:
-                a = a * col.scale
-                b = a if exact else b * col.scale
-                if col.scale < 0:
-                    a, b = b, a
-            ymin[col.name] = a
-            if not exact:
-                ymax[col.name] = b
-        return ymin, ymax
+                    out[key] = ((a >> bit) & 1).astype(np.uint8)
+            else:
+                out[col.name] = a if col.scale is None else a * col.scale
+        return out
 
     def snapshot(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
         """Copy of the full window (export, tests); the GUI redraw uses :meth:`view`."""
@@ -316,8 +305,7 @@ class RingBuffer:
             hi = self._n_total
             lo = self._resident_lo_locked()
             x = np.arange(lo, hi, dtype=np.int64)
-            chans, _ = self._traces([_read(r, lo, hi) for r in self._raw])
-            return x, chans
+            return x, self._traces([_read(r, lo, hi) for r in self._raw])
 
     def view(self, x0: float, x1: float, max_points: int) -> Optional[DecimatedView]:
         """Decimated slice of [x0, x1] for ~``max_points`` pixels; None if nothing resident."""
@@ -343,14 +331,16 @@ class RingBuffer:
                 b0 = max(lo_idx // s, i0 // s)
                 b1 = min((self._built[L] - 1), i1 // s)
                 if b1 >= b0:
-                    ymin, ymax = self._traces(
-                        [_read(a, b0, b1 + 1) for a in self._mn[L]],
-                        [_read(a, b0, b1 + 1) for a in self._mx[L]])
+                    ymin = self._traces([_read(a, b0, b1 + 1) for a in self._mn[L]])
+                    ymax = self._traces([_read(a, b0, b1 + 1) for a in self._mx[L]])
+                    for col in self._cols:          # a negative mult flips the envelope
+                        if col.scale is not None and col.scale < 0:
+                            ymin[col.name], ymax[col.name] = ymax[col.name], ymin[col.name]
                     # s is a power of 8, so the bucket centre is an exact integer.
                     x = np.arange(b0, b1 + 1, dtype=np.int64) * s + s // 2
                     return DecimatedView(exact=False, x=x, ymin=ymin, ymax=ymax)
 
             # Exact: raw samples (envelope min == max).
-            ymin, ymax = self._traces([_read(r, i0, i1 + 1) for r in self._raw])
+            cols = self._traces([_read(r, i0, i1 + 1) for r in self._raw])
             x = np.arange(i0, i1 + 1, dtype=np.int64)
-            return DecimatedView(exact=True, x=x, ymin=ymin, ymax=ymax)
+            return DecimatedView(exact=True, x=x, ymin=cols, ymax=cols)

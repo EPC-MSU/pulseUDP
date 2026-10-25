@@ -369,9 +369,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_history_changed(self, index: int) -> None:
         value = int(self._history_combo.itemData(index))
         if not self._history_fits(value):
-            channels = self._channel_count() or 0
-            need = RingBuffer.footprint_bytes(
-                self._model.columns() if self._model is not None else [], value)
+            channels = self._channel_count()      # not fitting implies a model
+            need = RingBuffer.footprint_bytes(self._model.columns(), value)
             self._append_log(
                 "error",
                 "History {} (~{:.1f} GiB for {} channels) exceeds free RAM; "
@@ -810,11 +809,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 x, chans = ring.snapshot()
                 keys = [k for k in drawn if k in chans]
                 # Structured rows keep each column's native dtype (exact int64 counters).
-                data = np.empty(x.size, dtype=[("sample", x.dtype)] + [
-                    ("c{}".format(i), chans[k].dtype) for i, k in enumerate(keys)])
-                data["sample"] = x
-                for i, k in enumerate(keys):
-                    data["c{}".format(i)] = chans[k]
+                data = np.rec.fromarrays([x] + [chans[k] for k in keys])
                 fmt = ["%d"] + [model.trace_format(k) for k in keys]
                 np.savetxt(path, data, fmt=fmt, delimiter="\t",
                            header="\t".join(["sample"] + keys), comments="")
