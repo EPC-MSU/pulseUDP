@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import threading
-import warnings
 from dataclasses import dataclass, field as _dc_field
 from typing import Dict, List, Optional, Tuple
 
@@ -15,9 +14,20 @@ from .protocol import Descriptor
 
 @dataclass
 class Trace:
-    key: str          # unique channel key in the RingBuffer
+    key: str          # unique trace key (RingBuffer view/snapshot)
     label: str
     is_bit: bool = False
+
+
+@dataclass
+class Column:
+    """One stored wire field: native dtype, ``mult`` applied on read, bits expanded on read."""
+
+    name: str
+    dtype: np.dtype
+    scale: Optional[float] = None
+    is_bitfield: bool = False
+    bits: List[Tuple[str, int]] = _dc_field(default_factory=list)   # (trace key, bit)
 
 
 @dataclass
@@ -35,6 +45,14 @@ class PlotModel:
         self.descriptor = descriptor
         self.groups: List[PlotGroup] = []
         self._channel_keys: List[str] = []
+
+        self._formats: Dict[str, str] = {}
+        for f in descriptor.fields:
+            if f.is_bitfield:
+                for name in f.bits or []:
+                    self._formats["{}.{}".format(f.name, name)] = "%d"
+            elif f.dtype.kind in "iu" and f.scale is None:
+                self._formats[f.name] = "%d"
 
         units_group: Dict[str, PlotGroup] = {}
         for f in descriptor.plot_fields:
@@ -63,36 +81,31 @@ class PlotModel:
 
     @property
     def channel_keys(self) -> List[str]:
-        """All trace keys, in plot order — the RingBuffer's channel set."""
+        """All trace keys, in plot order."""
         return list(self._channel_keys)
 
-    def extract(self, packets: np.ndarray) -> Tuple[int, Dict[str, np.ndarray]]:
-        return self.flatten(self.descriptor.channels(packets))
-
-    def flatten(self, channels: Dict[str, np.ndarray]
-                ) -> Tuple[int, Dict[str, np.ndarray]]:
-        """Map :meth:`Descriptor.channels` output to (n_samples, {trace_key: values})."""
-        n = 0
-        flat: Dict[str, np.ndarray] = {}
-        for f in self.descriptor.plot_fields:
-            col = channels.get(f.name)
-            if col is None:
-                continue   # disabled channel (v2.0): omitted -> NaN in the buffer
-            n = len(col)
+    def columns(self, enabled: Optional[List[bool]] = None) -> List[Column]:
+        """Storage columns for the enabled fields (all when ``enabled`` is None)."""
+        cols: List[Column] = []
+        for i, f in enumerate(self.descriptor.fields):
+            if enabled is not None and not (i < len(enabled) and enabled[i]):
+                continue
             if f.is_bitfield:
-                for name, arr in Descriptor.bit_traces(f, col).items():
-                    flat["{}.{}".format(f.name, name)] = arr.astype(np.float64)
+                bits = [("{}.{}".format(f.name, name), b)
+                        for b, name in enumerate(f.bits or []) if name != "Reserved"]
+                cols.append(Column(f.name, f.dtype, is_bitfield=True, bits=bits))
             else:
-                flat[f.name] = col
-        return n, flat
+                cols.append(Column(f.name, f.dtype, scale=f.scale))
+        return cols
+
+    def trace_format(self, key: str) -> str:
+        """Export format: ``%d`` for bits and unscaled integers (counters), else 5 digits."""
+        return self._formats.get(key, "%.5g")
 
 
 # Pyramid factor and height cap; rationale in docs/gui-design.md.
 PYRAMID_FACTOR = 8
 MAX_LEVELS = 12
-
-# float32 halves the footprint; X is never stored, it is regenerated as float64.
-_STORE_DTYPE = np.float32
 
 
 @dataclass
@@ -105,24 +118,35 @@ class DecimatedView:
     ymax: Dict[str, np.ndarray]
 
 
-def _nanmin(a: np.ndarray, axis: int) -> np.ndarray:
-    with warnings.catch_warnings():          # all-NaN bucket -> NaN (a gap), no warning
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanmin(a, axis=axis)
+def _read(arr: np.ndarray, lo: int, hi: int) -> np.ndarray:
+    """Copy samples/buckets [lo, hi) out of a 1-D ring."""
+    cap = arr.shape[0]
+    start = lo % cap
+    end = start + (hi - lo)
+    if end <= cap:
+        return arr[start:end].copy()
+    return np.concatenate((arr[start:], arr[:end - cap]))
 
 
-def _nanmax(a: np.ndarray, axis: int) -> np.ndarray:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanmax(a, axis=axis)
+def _write(arr: np.ndarray, lo: int, hi: int, data: np.ndarray) -> None:
+    """Write ``data`` into samples/buckets [lo, hi) of a 1-D ring."""
+    cap = arr.shape[0]
+    start = lo % cap
+    end = start + (hi - lo)
+    if end <= cap:
+        arr[start:end] = data
+        return
+    k = cap - start
+    arr[start:] = data[:k]
+    arr[:end - cap] = data[k:]
 
 
 class RingBuffer:
-    """Thread-safe ring + min/max pyramid; docs/gui-design.md (Rendering pipeline)."""
+    """Thread-safe native-typed ring + min/max pyramid; docs/gui-design.md (Rendering pipeline)."""
 
-    def __init__(self, channel_keys: List[str], window_n: int) -> None:
-        self._keys = list(channel_keys)
-        self._C = len(self._keys)
+    def __init__(self, columns: List[Column], window_n: int) -> None:
+        self._cols = list(columns)
+        self._names = [c.name for c in self._cols]
         self._lock = threading.Lock()
         self._allocate(int(window_n))
 
@@ -137,14 +161,13 @@ class RingBuffer:
         return capacity, levels
 
     @staticmethod
-    def footprint_bytes(n_channels: int, window_n: int) -> int:
+    def footprint_bytes(columns: List[Column], window_n: int) -> int:
         """Bytes this buffer would allocate for ``window_n`` (raw + pyramid)."""
         cap, levels = RingBuffer._plan(window_n)
-        itemsize = np.dtype(_STORE_DTYPE).itemsize
-        total = n_channels * cap * itemsize
+        per_sample = sum(c.dtype.itemsize for c in columns)
+        total = cap * per_sample
         for L in range(1, levels + 1):
-            cap_l = cap // (PYRAMID_FACTOR ** L)
-            total += 2 * n_channels * cap_l * itemsize           # min + max per level
+            total += 2 * (cap // (PYRAMID_FACTOR ** L)) * per_sample   # min + max per level
         return total
 
     def _allocate(self, window_n: int) -> None:
@@ -153,14 +176,14 @@ class RingBuffer:
         self._window_n = int(window_n)
         self._cap = cap
         self._levels = levels
-        self._raw = np.zeros((self._C, cap), dtype=_STORE_DTYPE)
-        # Pyramid level arrays, indexed 1..levels (index 0 is the raw ring).
-        self._mn: List[Optional[np.ndarray]] = [None] * (levels + 1)
-        self._mx: List[Optional[np.ndarray]] = [None] * (levels + 1)
+        self._raw = [np.zeros(cap, dtype=c.dtype) for c in self._cols]
+        # Pyramid level rings, indexed 1..levels (index 0 is the raw ring).
+        self._mn: List[List[np.ndarray]] = [self._raw]
+        self._mx: List[List[np.ndarray]] = [self._raw]
         for L in range(1, levels + 1):
             cap_l = cap // (PYRAMID_FACTOR ** L)
-            self._mn[L] = np.zeros((self._C, cap_l), dtype=_STORE_DTYPE)
-            self._mx[L] = np.zeros((self._C, cap_l), dtype=_STORE_DTYPE)
+            self._mn.append([np.zeros(cap_l, dtype=c.dtype) for c in self._cols])
+            self._mx.append([np.zeros(cap_l, dtype=c.dtype) for c in self._cols])
         # Next bucket index to build at each level (== count of built buckets).
         self._built = [0] * (levels + 1)
         self._n_total = 0          # samples seen since clear() == next X index
@@ -173,52 +196,31 @@ class RingBuffer:
     def capacity(self) -> int:
         return self._cap
 
-    def _store(self, level: int) -> Tuple[np.ndarray, np.ndarray, int]:
-        """Return (min_array, max_array, capacity) for a level (raw is level 0)."""
-        if level == 0:
-            return self._raw, self._raw, self._cap
-        return self._mn[level], self._mx[level], self._mn[level].shape[1]
-
-    def _gather(self, level: int, which: str, lo: int, hi: int) -> np.ndarray:
-        """Read buckets/samples [lo, hi) of a level into a contiguous (C, hi-lo)."""
-        mn, mx, cap_l = self._store(level)
-        arr = mx if which == "mx" else mn
-        count = hi - lo
-        start = lo % cap_l
-        end = start + count
-        if end <= cap_l:
-            return np.array(arr[:, start:end])
-        k = cap_l - start
-        out = np.empty((self._C, count), dtype=arr.dtype)
-        out[:, :k] = arr[:, start:cap_l]
-        out[:, k:] = arr[:, 0:end - cap_l]
-        return out
-
-    def _scatter(self, level: int, which: str, lo: int, hi: int,
-                 data: np.ndarray) -> None:
-        """Write ``data`` (C, hi-lo) into buckets/samples [lo, hi) of a level."""
-        mn, mx, cap_l = self._store(level)
-        arr = mx if which == "mx" else mn
-        count = hi - lo
-        start = lo % cap_l
-        end = start + count
-        if end <= cap_l:
-            arr[:, start:end] = data
-            return
-        k = cap_l - start
-        arr[:, start:cap_l] = data[:, :k]
-        arr[:, 0:end - cap_l] = data[:, k:]
+    @property
+    def trace_keys(self) -> List[str]:
+        keys: List[str] = []
+        for c in self._cols:
+            if c.is_bitfield:
+                keys.extend(k for k, _ in c.bits)
+            else:
+                keys.append(c.name)
+        return keys
 
     def _fill_level(self, L: int, b_lo: int, b_hi: int) -> None:
         """Compute buckets [b_lo, b_hi) of level L by reducing level L-1 by F."""
         F = PYRAMID_FACTOR
         count = b_hi - b_lo
-        child_mn = self._gather(L - 1, "mn", b_lo * F, b_hi * F)
-        child_mx = self._gather(L - 1, "mx", b_lo * F, b_hi * F)
-        self._scatter(L, "mn", b_lo, b_hi,
-                      _nanmin(child_mn.reshape(self._C, count, F), axis=2))
-        self._scatter(L, "mx", b_lo, b_hi,
-                      _nanmax(child_mx.reshape(self._C, count, F), axis=2))
+        for c, col in enumerate(self._cols):
+            child_mn = _read(self._mn[L - 1][c], b_lo * F, b_hi * F).reshape(count, F)
+            child_mx = _read(self._mx[L - 1][c], b_lo * F, b_hi * F).reshape(count, F)
+            if col.is_bitfield:            # per-bit envelope: min = AND, max = OR
+                mn = np.bitwise_and.reduce(child_mn, axis=1)
+                mx = np.bitwise_or.reduce(child_mx, axis=1)
+            else:                          # fmin/fmax skip a NaN sent on the wire
+                mn = np.fmin.reduce(child_mn, axis=1)
+                mx = np.fmax.reduce(child_mx, axis=1)
+            _write(self._mn[L][c], b_lo, b_hi, mn)
+            _write(self._mx[L][c], b_lo, b_hi, mx)
 
     def _build_incremental(self) -> None:
         for L in range(1, self._levels + 1):
@@ -248,11 +250,11 @@ class RingBuffer:
             resident = min(hi, self._cap)
             keep = min(resident, new_cap)
             lo = hi - keep
-            tail = self._gather(0, "mn", lo, hi) if keep else None   # read on OLD ring
-            self._allocate(new_w)                                    # resets to empty
+            tails = [_read(r, lo, hi) for r in self._raw] if keep else []   # OLD ring
+            self._allocate(new_w)                                          # resets to empty
             if keep:
-                self._n_total = lo
-                self._scatter(0, "mn", lo, hi, tail)
+                for r, tail in zip(self._raw, tails):
+                    _write(r, lo, hi, tail)
                 self._n_total = hi
                 self._rebuild(lo, hi)
 
@@ -261,20 +263,18 @@ class RingBuffer:
             self._n_total = 0
             self._built = [0] * (self._levels + 1)
 
-    def append(self, n: int, channels: Dict[str, np.ndarray]) -> None:
-        """Append ``n`` samples at the next X indices; absent keys are stored as NaN."""
+    def append(self, channels: Dict[str, np.ndarray]) -> None:
+        """Append one batch of raw columns; a batch whose fields differ from the columns
+        (decoded under a stale channel layout) is dropped."""
+        if not self._names or set(channels) != set(self._names):
+            return
+        n = len(channels[self._names[0]])
         if n <= 0:
             return
         with self._lock:
-            block = np.empty((self._C, n), dtype=_STORE_DTYPE)
-            for ci, k in enumerate(self._keys):
-                col = channels.get(k)
-                if col is None:
-                    block[ci, :] = np.nan
-                else:
-                    block[ci, :] = np.asarray(col, dtype=_STORE_DTYPE)
             a = self._n_total
-            self._scatter(0, "mn", a, a + n, block)
+            for r, name in zip(self._raw, self._names):
+                _write(r, a, a + n, channels[name])
             self._n_total = a + n
             self._build_incremental()
 
@@ -285,17 +285,38 @@ class RingBuffer:
     def _resident_lo_locked(self) -> int:
         return max(0, self._n_total - self._window_n)
 
+    def _traces(self, lo: List[np.ndarray], hi: Optional[List[np.ndarray]] = None
+                ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        """Per-column min/max -> per-trace dicts (mult applied, bits split); exact if no ``hi``."""
+        exact = hi is None
+        ymin: Dict[str, np.ndarray] = {}
+        ymax: Dict[str, np.ndarray] = ymin if exact else {}
+        for c, col in enumerate(self._cols):
+            a = lo[c]
+            b = a if exact else hi[c]
+            if col.is_bitfield:
+                for key, bit in col.bits:
+                    ymin[key] = ((a >> bit) & 1).astype(np.uint8)
+                    if not exact:
+                        ymax[key] = ((b >> bit) & 1).astype(np.uint8)
+                continue
+            if col.scale is not None:
+                a = a * col.scale
+                b = a if exact else b * col.scale
+                if col.scale < 0:
+                    a, b = b, a
+            ymin[col.name] = a
+            if not exact:
+                ymax[col.name] = b
+        return ymin, ymax
+
     def snapshot(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """Copy of the full window (tests); the GUI uses :meth:`view`."""
+        """Copy of the full window (export, tests); the GUI redraw uses :meth:`view`."""
         with self._lock:
-            if self._n_total == 0:
-                empty = np.empty(0, dtype=np.float64)
-                return empty, {k: np.empty(0, dtype=np.float64) for k in self._keys}
             hi = self._n_total
             lo = self._resident_lo_locked()
-            x = np.arange(lo, hi, dtype=np.float64)
-            raw = self._gather(0, "mn", lo, hi)
-            chans = {k: raw[i].astype(np.float64) for i, k in enumerate(self._keys)}
+            x = np.arange(lo, hi, dtype=np.int64)
+            chans, _ = self._traces([_read(r, lo, hi) for r in self._raw])
             return x, chans
 
     def view(self, x0: float, x1: float, max_points: int) -> Optional[DecimatedView]:
@@ -322,16 +343,14 @@ class RingBuffer:
                 b0 = max(lo_idx // s, i0 // s)
                 b1 = min((self._built[L] - 1), i1 // s)
                 if b1 >= b0:
-                    ymin = self._gather(L, "mn", b0, b1 + 1)
-                    ymax = self._gather(L, "mx", b0, b1 + 1)
-                    x = (np.arange(b0, b1 + 1, dtype=np.float64) + 0.5) * s
-                    return DecimatedView(
-                        exact=False, x=x,
-                        ymin={k: ymin[i] for i, k in enumerate(self._keys)},
-                        ymax={k: ymax[i] for i, k in enumerate(self._keys)})
+                    ymin, ymax = self._traces(
+                        [_read(a, b0, b1 + 1) for a in self._mn[L]],
+                        [_read(a, b0, b1 + 1) for a in self._mx[L]])
+                    # s is a power of 8, so the bucket centre is an exact integer.
+                    x = np.arange(b0, b1 + 1, dtype=np.int64) * s + s // 2
+                    return DecimatedView(exact=False, x=x, ymin=ymin, ymax=ymax)
 
             # Exact: raw samples (envelope min == max).
-            raw = self._gather(0, "mn", i0, i1 + 1)
-            x = np.arange(i0, i1 + 1, dtype=np.float64)
-            cols = {k: raw[i] for i, k in enumerate(self._keys)}
-            return DecimatedView(exact=True, x=x, ymin=cols, ymax=cols)
+            ymin, ymax = self._traces([_read(r, i0, i1 + 1) for r in self._raw])
+            x = np.arange(i0, i1 + 1, dtype=np.int64)
+            return DecimatedView(exact=True, x=x, ymin=ymin, ymax=ymax)

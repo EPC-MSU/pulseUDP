@@ -352,11 +352,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _history_fits(self, window_n: int) -> bool:
         """RAM guard; optimistic until the channel count is known (docs/gui-design.md)."""
-        channels = self._channel_count()
         avail = _available_ram_bytes()
-        if channels is None or avail is None:
+        if self._model is None or avail is None:
             return True
-        return RingBuffer.footprint_bytes(channels, window_n) <= RAM_BUDGET_FRACTION * avail
+        need = RingBuffer.footprint_bytes(self._model.columns(), window_n)   # all channels
+        return need <= RAM_BUDGET_FRACTION * avail
 
     def _select_history_value(self, value: int) -> None:
         """Reflect an accepted history size in the combo without re-triggering."""
@@ -370,7 +370,8 @@ class MainWindow(QtWidgets.QMainWindow):
         value = int(self._history_combo.itemData(index))
         if not self._history_fits(value):
             channels = self._channel_count() or 0
-            need = RingBuffer.footprint_bytes(channels, value)
+            need = RingBuffer.footprint_bytes(
+                self._model.columns() if self._model is not None else [], value)
             self._append_log(
                 "error",
                 "History {} (~{:.1f} GiB for {} channels) exceeds free RAM; "
@@ -395,7 +396,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._history_n = value
                     break
             self._select_history_value(self._history_n)
-        self._ring = RingBuffer(self._model.channel_keys, window_n=self._history_n)
+        self._ring = RingBuffer(self._model.columns(), window_n=self._history_n)
         self._n_channels = len(descriptor.fields)
         v2 = (self._client is not None and self._client.version[0] >= 2)
         self._selectable = v2
@@ -450,10 +451,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_telemetry(self, channels: Dict[str, np.ndarray]) -> None:
         # Receiver thread; RingBuffer is thread-safe.
-        if self._model is None or self._ring is None:
-            return
-        n, flat = self._model.flatten(channels)
-        self._ring.append(n, flat)
+        ring = self._ring
+        if ring is not None:
+            ring.append(channels)
 
     def _build_plots(self, descriptor: Descriptor) -> None:
         """Tree once per connection; plots are re-rendered on every show/hide."""
@@ -736,8 +736,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                    else QtCore.Qt.Unchecked)
         finally:
             self._suppress_check = False
-        if self._ring is not None:
-            self._ring.clear()              # packet layout changed
+        if self._model is not None:     # packet layout changed: store only the enabled set
+            self._ring = RingBuffer(self._model.columns(enabled), window_n=self._history_n)
         self._render_plots(preserve_view=False)
         self._set_checks_enabled(not self._running)
 
@@ -802,13 +802,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         ring = self._ring
-        keys = list(self._curves.keys())
+        model = self._model
+        drawn = list(self._curves.keys())
 
         def work():
             try:
                 x, chans = ring.snapshot()
-                data = np.column_stack([x] + [chans[k] for k in keys])
-                fmt = ["%d"] + ["%.5g"] * len(keys)
+                keys = [k for k in drawn if k in chans]
+                # Structured rows keep each column's native dtype (exact int64 counters).
+                data = np.empty(x.size, dtype=[("sample", x.dtype)] + [
+                    ("c{}".format(i), chans[k].dtype) for i, k in enumerate(keys)])
+                data["sample"] = x
+                for i, k in enumerate(keys):
+                    data["c{}".format(i)] = chans[k]
+                fmt = ["%d"] + [model.trace_format(k) for k in keys]
                 np.savetxt(path, data, fmt=fmt, delimiter="\t",
                            header="\t".join(["sample"] + keys), comments="")
                 self._bridge.log.emit(LogEvent(

@@ -48,16 +48,26 @@ def test_packet_size_and_plot_fields():
         "Timestamp", "VoltageA", "Current", "Flags", "Counter"]
 
 
-def test_decode_roundtrip_applies_mult_and_signs():
+def test_decode_roundtrip_keeps_raw_native_values():
+    # channels() returns wire values in their own dtype; mult is applied on read (model).
     d = Descriptor.from_json(EXAMPLE)
     payload = _pack(1000, 250, -5, 0b101, -42) + _pack(2000, -250, 7, 0b100, 99)
     packets = d.decode(payload)
     assert packets.size == 2
     ch = d.channels(packets)
-    assert np.allclose(ch["Timestamp"], [1.0, 2.0])      # uint32 * 0.001
-    assert np.allclose(ch["VoltageA"], [2.5, -2.5])      # int16 * 0.01
-    assert np.allclose(ch["Current"], [-0.005, 0.007])   # int16 * 0.001
-    assert np.allclose(ch["Counter"], [-42.0, 99.0])     # int32, no mult
+    assert ch["Timestamp"].dtype == np.uint32 and list(ch["Timestamp"]) == [1000, 2000]
+    assert ch["VoltageA"].dtype == np.int16 and list(ch["VoltageA"]) == [250, -250]
+    assert list(ch["Current"]) == [-5, 7]
+    assert ch["Counter"].dtype == np.int32 and list(ch["Counter"]) == [-42, 99]
+    assert list(ch["Flags"]) == [0b101, 0b100]
+
+
+def test_field_scale_ignores_unit_mult():
+    from pulseudp.protocol import Field
+    assert Field("a", "int16", mult=0.01).scale == 0.01
+    assert Field("a", "int16", mult=1).scale is None
+    assert Field("a", "int16").scale is None
+    assert Field("a", "int8").dtype == np.int8
 
 
 def test_trailing_pad_is_ignored():
@@ -87,9 +97,9 @@ def test_descriptor_subset_matches_wire_layout():
                + struct.pack("<hh", 250, 0)         # VoltageA
                + struct.pack("<i", -42))            # Counter
     ch = sub.channels(sub.decode(payload))
-    assert np.allclose(ch["Timestamp"], [1.0])
-    assert np.allclose(ch["VoltageA"], [2.5])
-    assert np.allclose(ch["Counter"], [-42.0])
+    assert list(ch["Timestamp"]) == [1000]
+    assert list(ch["VoltageA"]) == [250]
+    assert list(ch["Counter"]) == [-42]
     assert "Current" not in ch                      # disabled field absent
 
 

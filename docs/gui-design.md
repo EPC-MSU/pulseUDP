@@ -40,8 +40,8 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
   not word-aligned logs an `align` row but is still decoded tolerantly (checked after the CRC, so
   a corrupt header never triggers it). A v2.0 reassembly that over-runs its declared length or
   times out (300 ms) logs a `reasm` row and drops the message (all-or-nothing, RFC §5.6).
-- **Client callbacks:** `UdpClient` is Qt-free; telemetry (per-field physical arrays for the
-  enabled channels), log events and state changes arrive as plain callables on the receiver
+- **Client callbacks:** `UdpClient` is Qt-free; telemetry (per-field **raw wire arrays** in their
+  native dtype for the enabled channels — `mult` is applied on read, not on decode), log events and state changes arrive as plain callables on the receiver
   thread, and the GUI marshals them onto the GUI thread through Qt signals. Every request is
   retransmitted until answered or the retry budget runs out. Under v1.0 `get_channels` /
   `set_channels` return all-on without touching the wire.
@@ -77,7 +77,7 @@ parses descriptors validated against [`../spec/Schema.json`](../spec/Schema.json
 [receiver thread]                         [GUI thread]
  blocking recvfrom ──► decode datagram      QTimer 30 Hz
    → NumPy structured-dtype view              └─ read latest slice of RingBuffer
-   → (n packets × fields) float array         └─ update pyqtgraph curves
+   → per-field native-dtype columns           └─ update pyqtgraph curves
    → append to RingBuffer (lock)              user events → UdpClient (queued signals)
    → emit log events (loss/CRC/bad-magic)
 ```
@@ -91,7 +91,8 @@ From the descriptor build a NumPy **structured dtype** with explicit per-field o
 `itemsize = packet_size`. Each field reads the low bytes of its 32-bit word span
 (little-endian → an `int16` in a 4-byte word reads its low 2 bytes; `double` reads 8). Then
 `np.frombuffer(payload[:n*packet], dtype=plan)` decodes a whole datagram (up to 45 packets) in
-one call; multipliers apply as vectorized float ops. `n_packets = payload_len // packet_size`
+one call. The columns stay in their wire dtype; `mult` is applied on read (redraw, export),
+so storage is exact and as compact as the wire. `n_packets = payload_len // packet_size`
 (trailing pad ignored, per RFC §5.3).
 
 ## UI layout (single window, stacked panels)
@@ -129,7 +130,11 @@ one call; multipliers apply as vectorized float ops. `n_packets = payload_len //
    follow logic. What remains is **Export all…** plus pyqtgraph's scene exporter, renamed
    *qtgraph export…* (current image). *Export all…* writes every **drawn** trace's whole retained
    window (not just the visible range) as a tab-delimited file: header row, an integer `sample`
-   column, then one column per trace key at 5 significant digits; written off the GUI thread.
+   column, then one column per trace key; written off the GUI thread. Bit traces and integer
+   fields without a `mult` (or `mult` 1) are written as exact integers (`%d`) — these are
+   counters, not measurements. Everything else is a measurement and is written at 5 significant
+   digits (`%.5g`), the usual accuracy of the source. Rows are built with each column's own dtype,
+   so 64-bit counters are not rounded through `float64`.
 4. **Log dock (bottom, collapsible):** host-time timestamps; categories listed above.
 
 ## X axis & zoom/pan state machine
@@ -152,13 +157,17 @@ The history store (`model.RingBuffer`) decouples *storage* from *rendering* so a
 draws at screen resolution without per-frame work proportional to its size. Two structures, both
 **channel-major** and built for ≤16 simultaneous channels:
 
-- **Raw ring** — a preallocated `(n_channels, capacity)` `float32` array with a wrapping write
-  index. Appends are a single vectorised slice-assign; the X axis is *not* stored — it is the integer sample index, regenerated as
-  `float64` on read (`float32` cannot represent sample indices past `2**24`). `float32` halves the
-  footprint versus the decoded `float64`, which matters at large windows; plotting needs only
-  ~7 digits.
-- **Min/max pyramid** — for each level `L ≥ 1`, two `(n_channels, capacity / Fᴸ)` arrays holding
-  the **min and max** of every `Fᴸ` raw samples, with **`F = 8`**. `F = 8` keeps the level count
+- **Raw ring** — one preallocated 1-D ring of length `capacity` **per wire field**, in the field's
+  **native wire dtype** (`int8` stays 1 byte, `int64`/`double` stay exact), with a shared wrapping
+  write index. Values are stored *before* `mult`; scaling happens on read, which is `O(pixels)` per
+  redraw. A bitfield is **one `uint32` column** and is split into per-bit 0/1 traces on read. The X
+  axis is *not* stored — it is the integer sample index, regenerated as `int64` on read.
+- **Min/max pyramid** — for each level `L ≥ 1`, two rings of length `capacity / Fᴸ` per column
+  holding the **min and max** of every `Fᴸ` raw samples, with **`F = 8`**, in the **same native
+  dtype** as the raw ring: min/max only selects existing values, so every level is exact and
+  needs no conversion. Numeric columns reduce with `fmin`/`fmax` (a NaN sent on the wire does not
+  blank a bucket); bitfield columns reduce with bitwise **AND** (min) and **OR** (max), which is
+  exactly the per-bit min/max envelope. `F = 8` keeps the level count
   low (one level per three binary octaves) while bounding total pyramid memory to ≈ `1/(F−1) ≈ 14%`
   of the raw store. The pyramid is itself a set of rings aligned to the raw ring, so coarse buckets
   age out in lockstep with the raw samples they summarise. The level count is the tallest pyramid
@@ -166,11 +175,16 @@ draws at screen resolution without per-frame work proportional to its size. Two 
 - **Capacity** is the requested window rounded **up** to a whole number of coarsest-level buckets
   (so every level's ring divides evenly). Reads (`view`, `snapshot`) only ever expose the latest
   `window_n` samples, so the rounding never leaks older data.
-- **Channel keys:** a numeric field's key is its name; a bitfield bit's key is `field.bit`
-  (`PlotModel` expands each bitfield into one 0/1 trace per non-`Reserved` bit). Channels absent
-  from an append (disabled v2.0 channels) are stored as NaN.
+- **Columns and trace keys:** `PlotModel.columns(enabled)` gives one column per **enabled**
+  field. Reads are keyed by trace: a numeric field's key is its name, a bitfield bit's key is
+  `field.bit` (one 0/1 trace per non-`Reserved` bit). A negative `mult` swaps min and max on read.
+- **Only enabled channels are stored.** A v2.0 enabled-set change alters the packet layout and
+  clears the history, so the ring is simply **reallocated over the new set**. There are no gaps,
+  no NaN fill and no validity masks. A batch whose fields differ from the ring's columns (decoded
+  under the old layout during the switch) is dropped. Under v1.0 every field is stored; local
+  hide only affects drawing.
 - `PlotModel` and `RingBuffer` are Qt-free so both are unit-testable headless; `snapshot()` (a copy
-  of the whole window) exists for tests only — the GUI redraw uses `view()`.
+  of the whole window) serves *Export all…* and tests — the GUI redraw uses `view()`.
 
 **The pyramid is maintained incrementally, never rebuilt from all data.** On each `append`, the
 new samples are folded up the levels — level 1 from the raw block, level `L` by reducing `F`
@@ -184,10 +198,11 @@ resident window, computes `samples_per_pixel = span / max_points`, and picks the
 whose bucket spans ≤ one pixel (`L = ⌊log_F(spp)⌋`, clamped). It then slices that level's min/max
 rings over the visible range and returns ~`2 · pixel_width` points. When zoomed in past one
 sample per pixel — or when no complete bucket covers the range yet — it returns **exact raw
-samples** instead (min = max). X of a decimated bucket is its centre. The GUI draws an envelope by emitting
+samples** instead (min = max). X of a decimated bucket is its centre, `b·s + s/2` — an exact
+integer because `s = 8ᴸ` is even; X turns into floating point only when Qt paints. The GUI draws an envelope by emitting
 two points per bucket (min then max) at the bucket's X, so spikes survive decimation:
 **every level except the finest shows the min/max envelope, the finest is exact
-samples**. Disabled v2.0 channels are all-NaN and reduce to NaN buckets, which draw as gaps.
+samples**.
 
 `pyqtgraph`'s own auto-downsampling is therefore left off (we pre-decimate), and global
 antialiasing is disabled because the point count is already near the pixel width.
@@ -196,8 +211,9 @@ antialiasing is disabled because the point count is already near the pixel width
 **tail back at its original sample indices** so the X axis stays continuous, then rebuilds the
 pyramid over it — an `O(retained)` one-shot on a deliberate user action, not a per-frame cost.
 
-**RAM guard.** `RingBuffer.footprint_bytes(n_channels, window_n)` reports the exact allocation
-(raw + pyramid). Before accepting a new history size the GUI checks it against
+**RAM guard.** `RingBuffer.footprint_bytes(columns, window_n)` reports the exact allocation
+(raw + pyramid, from each column's itemsize), checked against the full field set (the worst
+case). Before accepting a new history size the GUI checks it against
 `RAM_BUDGET_FRACTION` (0.8) of free RAM (read with `psutil`, in the `gui` extra); an
 over-budget choice is logged and rejected (the previous size is kept), and once the real channel
 count is known on connect an over-budget default is clamped down to the largest option that fits. Before connect

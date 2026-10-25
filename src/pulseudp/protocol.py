@@ -136,6 +136,16 @@ class Field:
     def is_bitfield(self) -> bool:
         return self.type == "bitfield"
 
+    @property
+    def dtype(self) -> np.dtype:
+        """Native NumPy dtype of the wire value (before ``mult``)."""
+        return np.dtype(_NUMPY_CODE[self.type])
+
+    @property
+    def scale(self) -> Optional[float]:
+        """``mult`` to apply on read, or None when absent or 1."""
+        return None if self.mult is None or self.mult == 1 else float(self.mult)
+
 
 class Descriptor:
     """A parsed telemetry descriptor: field layout plus a NumPy decode plan."""
@@ -222,18 +232,9 @@ class Descriptor:
         return np.frombuffer(payload, dtype=self._dtype, count=n)
 
     def channels(self, packets: np.ndarray) -> Dict[str, np.ndarray]:
-        """Per-field arrays: numeric as float64 with ``mult`` applied, bitfields as raw uint32."""
-        out: Dict[str, np.ndarray] = {}
-        for f, dname in zip(self.fields, self._dtype_names):
-            col = packets[dname]
-            if f.is_bitfield:
-                out[f.name] = col
-            else:
-                v = col.astype(np.float64)
-                if f.mult is not None:
-                    v = v * f.mult
-                out[f.name] = v
-        return out
+        """Per-field raw wire arrays in their native dtype; ``mult`` is applied on read."""
+        return {f.name: packets[dname]
+                for f, dname in zip(self.fields, self._dtype_names)}
 
     @staticmethod
     def bit_traces(field: Field, values: np.ndarray) -> Dict[str, np.ndarray]:
